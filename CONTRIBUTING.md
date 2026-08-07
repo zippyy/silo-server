@@ -73,9 +73,10 @@ See the README for full setup. Common checks:
 ```sh
 go test ./...                        # Go tests
 golangci-lint run                    # Go lint
-cd web && bun test                   # Frontend tests
-cd web && bun run lint               # Frontend lint
-cd web && bun run format:check       # Frontend formatting
+cd web && pnpm test                  # Frontend tests
+cd web && pnpm run lint              # Frontend lint
+cd web && pnpm run format:check      # Frontend formatting
+make verify-local-paths              # Docs hygiene check
 ```
 
 If your change spans `Silo` and `silo-plugin-sdk`, local iteration through [`go.work`](go.work) is expected. Do not rely on that workspace in repo-tracked config or release pipelines. CI validates this repo with `GOWORK=off`, and any new SDK package or symbol must come from a pushed, tagged `github.com/Silo-Server/silo-plugin-sdk` release before the change is ready to merge.
