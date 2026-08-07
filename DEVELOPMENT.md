@@ -79,7 +79,7 @@ database URL should be read from a non-default env file.
 go test ./...
 
 # Frontend tests
-cd web && bun test
+cd web && pnpm test
 ```
 
 ## Linting
@@ -89,8 +89,8 @@ cd web && bun test
 golangci-lint run
 
 # Frontend
-cd web && bun run lint
-cd web && bun run format:check
+cd web && pnpm run lint
+cd web && pnpm run format:check
 ```
 
 ## Project Structure
