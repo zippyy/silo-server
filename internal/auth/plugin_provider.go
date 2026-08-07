@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -308,12 +309,20 @@ func (p *PluginProvider) synchronizeClaimedRole(
 		if err != nil {
 			return nil, err
 		}
+		if defaultGroupID == nil {
+			return nil, fmt.Errorf("cannot demote user %d to %s: no default access group configured", user.ID, desiredRole)
+		}
 	}
 
 	input, changed := roleSyncUpdateInput(user, desiredRole, defaultGroupID)
 	if !changed {
 		return user, nil
 	}
+	slog.InfoContext(ctx, "synchronizing plugin-authenticated user role",
+		"user_id", user.ID,
+		"previous_role", user.Role,
+		"new_role", desiredRole,
+	)
 	if err := p.users.Update(ctx, user.ID, input); err != nil {
 		return nil, fmt.Errorf("synchronize plugin-authenticated user role: %w", err)
 	}
