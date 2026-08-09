@@ -1,0 +1,165 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	var hardened bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'plugin_auth_identities'
+			  AND column_name = 'capability_id'
+		)`).Scan(&hardened); err != nil {
+		t.Fatal(err)
+	}
+	if !hardened {
+		t.Skip("plugin auth identity hardening migration is not applied")
+	}
+
+	prefix := "managed-role-http-" + uuid.NewString()
+	var installationID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO plugin_installations (plugin_id, version, install_path)
+		VALUES ($1, 'test', $2)
+		RETURNING id`, prefix, "/tmp/"+prefix).Scan(&installationID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM plugin_installations WHERE id = $1`, installationID); err != nil {
+			t.Errorf("delete plugin installation: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM users WHERE email = $1`, prefix+"@example.test"); err != nil {
+			t.Errorf("delete user: %v", err)
+		}
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, enabled, auto_provision)
+		VALUES ($1, 'ldap', true, true)`, installationID); err != nil {
+		t.Fatal(err)
+	}
+	userRepo := auth.NewUserRepository(pool)
+	user, err := userRepo.Create(ctx, models.CreateUserInput{
+		Email:    prefix + "@example.test",
+		Username: prefix,
+		Password: "test-only-password",
+		Role:     "user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := auth.PluginIdentityKey{
+		InstallationID:  installationID,
+		CapabilityID:    "ldap",
+		ExternalSubject: "entryUUID:http-admin",
+	}
+	identityRepo := auth.NewPluginIdentityRepository(pool)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := identityRepo.ClaimTx(ctx, tx, key, user.ID)
+	if err != nil || !claimed {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("claim identity=%v, %v", claimed, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions := auth.NewSessionRepository(pool)
+	provider := auth.NewPluginProviderWithClientFactory(
+		auth.PluginProviderConfig{
+			InstallationID:      installationID,
+			CapabilityID:        "ldap",
+			AutoProvision:       true,
+			ManagedRoleContract: auth.ManagedRoleContractV1,
+		},
+		sessions,
+		userRepo,
+		pool,
+		nil,
+	)
+	response := managedRoleResponse(t, key.ExternalSubject, "admin")
+	promoted, err := provider.CompleteOAuth(ctx, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Role != "admin" {
+		t.Fatalf("promoted role=%q, want admin", promoted.Role)
+	}
+
+	sessionID := uuid.NewString()
+	if err := sessions.Create(ctx, models.AuthSession{
+		ID:        sessionID,
+		UserID:    promoted.ID,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jwtService := auth.NewJWTService("managed-role-revocation-test-secret", time.Hour, time.Hour)
+	token, err := jwtService.GenerateAccessToken(promoted.ID, "admin", sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAuthMiddleware(jwtService, sessions, nil, nil).RequireAuth(
+		RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})),
+	)
+	request := func() int {
+		req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		return recorder.Code
+	}
+	if status := request(); status != http.StatusNoContent {
+		t.Fatalf("admin token before demotion status=%d, want %d", status, http.StatusNoContent)
+	}
+
+	if _, err := provider.CompleteOAuth(ctx, managedRoleResponse(t, key.ExternalSubject, "user")); err != nil {
+		t.Fatal(err)
+	}
+	if status := request(); status != http.StatusUnauthorized {
+		t.Fatalf("same admin token after demotion status=%d, want %d", status, http.StatusUnauthorized)
+	}
+}
+
+func managedRoleResponse(t *testing.T, subject, role string) *pluginv1.AuthenticateResponse {
+	t.Helper()
+	claims, err := structpb.NewStruct(map[string]any{
+		"silo_role_contract": auth.ManagedRoleContractV1,
+		"silo_role_managed":  true,
+		"silo_role":          role,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &pluginv1.AuthenticateResponse{ExternalSubject: subject, Claims: claims}
+}
