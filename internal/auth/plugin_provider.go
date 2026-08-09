@@ -456,7 +456,7 @@ func (p *PluginProvider) logRoleTransition(ctx context.Context, userID int, tran
 		"user_id", userID,
 		"previous_role", transition.previous,
 		"new_role", transition.next,
-		"contract", ManagedRoleContractV1,
+		"contract", p.config.ManagedRoleContract,
 	)
 }
 
