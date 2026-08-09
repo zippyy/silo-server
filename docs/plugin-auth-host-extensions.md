@@ -44,4 +44,6 @@ Before promoting a normal user, Silo snapshots locally owned permissions and acc
 
 External identities are immutable and scoped by plugin installation, capability ID, and external subject. User creation and claiming that identity commit atomically. A competing first login resolves to the existing owner and cannot repoint the identity.
 
+Credential providers are always resolved by installation and capability. The current OAuth launch URL is installation-scoped; an installation exposing more than one auth capability is therefore rejected as ambiguous for OAuth instead of selecting a capability by registration or map order.
+
 Successful managed-role transitions are logged after commit with the plugin installation ID, capability ID, user ID, previous role, new role, and contract version. Raw claims and directory data are not logged.
