@@ -151,12 +151,15 @@ func (s *Service) RegisterProvider(info LoginProviderInfo, provider AuthProvider
 	}
 }
 
-// FindOAuthInstallation returns the PluginProvider registered for the given
-// plugin installation, if it is an OAuth-capable provider. nil if no match.
+// FindOAuthInstallation returns the only PluginProvider registered for the
+// installation. The current OAuth route is installation-scoped, so multiple
+// auth capabilities are ambiguous and fail closed instead of selecting one by
+// map iteration order.
 func (s *Service) FindOAuthInstallation(installationID int) *PluginProvider {
 	if installationID <= 0 {
 		return nil
 	}
+	var match *PluginProvider
 	for _, p := range s.providers {
 		pp, ok := p.(*PluginProvider)
 		if !ok || pp == nil {
@@ -165,10 +168,23 @@ func (s *Service) FindOAuthInstallation(installationID int) *PluginProvider {
 		if pp.InstallationID() != installationID {
 			continue
 		}
-		// Only OAuth-capable installs participate in /oauth/... routes. The
-		// caller (OAuthHandler.ResolveClient) checks Mode metadata; here we
-		// simply scope to PluginProvider instances bound to this install.
-		return pp
+		if match != nil {
+			return nil
+		}
+		match = pp
+	}
+	return match
+}
+
+func (s *Service) findPluginProvider(installationID int, capabilityID string) *PluginProvider {
+	if installationID <= 0 || capabilityID == "" {
+		return nil
+	}
+	for _, p := range s.providers {
+		pp, ok := p.(*PluginProvider)
+		if ok && pp != nil && pp.InstallationID() == installationID && pp.CapabilityID() == capabilityID {
+			return pp
+		}
 	}
 	return nil
 }
@@ -179,7 +195,7 @@ func (s *Service) FindOAuthInstallation(installationID int) *PluginProvider {
 // looks up or auto-provisions the user, creates a session, and mints
 // access/refresh tokens.
 func (s *Service) CompleteOAuthLogin(ctx context.Context, in OAuthLoginInput) (*TokenPair, *models.User, error) {
-	provider := s.FindOAuthInstallation(in.InstallationID)
+	provider := s.findPluginProvider(in.InstallationID, in.CapabilityID)
 	if provider == nil {
 		return nil, nil, ErrInvalidCredentials
 	}
@@ -187,13 +203,9 @@ func (s *Service) CompleteOAuthLogin(ctx context.Context, in OAuthLoginInput) (*
 	if err != nil {
 		return nil, nil, err
 	}
-	// Linking flow (sess.LinkingUserID > 0): we already provisioned/identified
-	// `user` via the plugin identity. If the caller asked to link onto a
-	// different existing user, future work will need to:
-	//   - reject if the identity is already linked elsewhere (409)
-	//   - otherwise upsert plugin_auth_identities to point at LinkingUserID
-	// For v1 the OAuth handler always passes 0; the v1 PR doesn't add the
-	// /me/account "Link account" SPA UI. Leaving as a TODO.
+	// Linking is not implemented in v1. A future flow must claim an unowned
+	// capability-scoped subject for the selected user atomically and reject an
+	// existing owner; external identity ownership must never be repointed.
 	_ = in.LinkingUserID
 
 	sessionID := uuid.New().String()
