@@ -119,12 +119,12 @@ func (p *PluginProvider) completeAuthentication(
 		return nil, ErrInvalidCredentials
 	}
 	key := p.identityKey(response.GetExternalSubject())
-	identity, user, err := p.lookupIdentityUser(ctx, key)
+	user, err := p.lookupIdentityUser(ctx, key)
 	if err == nil {
 		if !user.Enabled {
 			return nil, ErrUserDisabled
 		}
-		return p.synchronizeManagedRole(ctx, key, identity, user, response)
+		return p.synchronizeManagedRole(ctx, key, user, response)
 	}
 	if !errors.Is(err, ErrNotFound) {
 		return nil, err
@@ -171,16 +171,16 @@ func (p *PluginProvider) identityKey(externalSubject string) PluginIdentityKey {
 func (p *PluginProvider) lookupIdentityUser(
 	ctx context.Context,
 	key PluginIdentityKey,
-) (*PluginAuthIdentity, *models.User, error) {
+) (*models.User, error) {
 	identity, err := p.identities.Get(ctx, key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	user, err := p.users.GetByID(ctx, identity.UserID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return identity, user, nil
+	return user, nil
 }
 
 func (p *PluginProvider) autoProvisionUser(
@@ -218,7 +218,7 @@ func (p *PluginProvider) autoProvisionUser(
 		if !user.Enabled {
 			return nil, ErrUserDisabled
 		}
-		return p.synchronizeManagedRole(ctx, key, existing, user, response)
+		return p.synchronizeManagedRole(ctx, key, user, response)
 	} else if !errors.Is(getErr, ErrNotFound) {
 		return nil, getErr
 	}
@@ -235,12 +235,12 @@ func (p *PluginProvider) autoProvisionUser(
 			if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
 				return nil, fmt.Errorf("rollback plugin email collision: %w", rollbackErr)
 			}
-			identity, winner, lookupErr := p.lookupIdentityUser(ctx, key)
+			winner, lookupErr := p.lookupIdentityUser(ctx, key)
 			if lookupErr == nil {
 				if !winner.Enabled {
 					return nil, ErrUserDisabled
 				}
-				return p.synchronizeManagedRole(ctx, key, identity, winner, response)
+				return p.synchronizeManagedRole(ctx, key, winner, response)
 			}
 			if errors.Is(lookupErr, ErrNotFound) {
 				return nil, ErrPluginEmailConflict
@@ -258,14 +258,14 @@ func (p *PluginProvider) autoProvisionUser(
 		if err := tx.Rollback(ctx); err != nil {
 			return nil, fmt.Errorf("rollback losing plugin identity claim: %w", err)
 		}
-		identity, winner, err := p.lookupIdentityUser(ctx, key)
+		winner, err := p.lookupIdentityUser(ctx, key)
 		if err != nil {
 			return nil, err
 		}
 		if !winner.Enabled {
 			return nil, ErrUserDisabled
 		}
-		return p.synchronizeManagedRole(ctx, key, identity, winner, response)
+		return p.synchronizeManagedRole(ctx, key, winner, response)
 	}
 
 	transition := roleTransition{}
@@ -328,7 +328,6 @@ func (p *PluginProvider) createProvisionedUserTx(
 func (p *PluginProvider) synchronizeManagedRole(
 	ctx context.Context,
 	key PluginIdentityKey,
-	_ *PluginAuthIdentity,
 	user *models.User,
 	response *pluginv1.AuthenticateResponse,
 ) (*models.User, error) {
@@ -447,7 +446,7 @@ func (p *PluginProvider) applyManagedRoleTx(
 }
 
 func (p *PluginProvider) logRoleTransition(ctx context.Context, userID int, transition roleTransition) {
-	if !transition.changed {
+	if !transition.changed || transition.previous == transition.next {
 		return
 	}
 	slog.InfoContext(ctx, "plugin-managed user role changed",
