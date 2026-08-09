@@ -32,6 +32,9 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	t.Helper()
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
+		if os.Getenv("SILO_REQUIRE_AUTH_DB_TESTS") == "1" {
+			t.Fatal("SILO_REQUIRE_AUTH_DB_TESTS=1 requires SILO_TEST_DATABASE_URL")
+		}
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
 	}
 	ctx := context.Background()
@@ -62,6 +65,9 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	}
 	if !hardened {
 		pool.Close()
+		if os.Getenv("SILO_REQUIRE_AUTH_DB_TESTS") == "1" {
+			t.Fatal("SILO_REQUIRE_AUTH_DB_TESTS=1 requires plugin auth hardening migrations")
+		}
 		t.Skip("plugin auth identity hardening migration is not applied")
 	}
 

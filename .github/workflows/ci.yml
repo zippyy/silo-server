@@ -106,6 +106,74 @@ jobs:
       - name: Test
         run: make test-go
 
+  auth-db-security:
+    name: Auth PostgreSQL security
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: silo_test
+          POSTGRES_PASSWORD: silo_test
+          POSTGRES_DB: silo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U silo_test -d silo_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://silo_test:silo_test@127.0.0.1:5432/silo_test?sslmode=disable
+      SILO_TEST_DATABASE_URL: postgres://silo_test:silo_test@127.0.0.1:5432/silo_test?sslmode=disable
+      SILO_REQUIRE_AUTH_DB_TESTS: "1"
+      SECRET_KEY: ci-auth-security-secret-key-at-least-32-bytes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvips-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Stub the embedded frontend bundle
+        run: make embed-stub
+
+      - name: Apply migrations
+        run: make migrate-up
+
+      # SILO_REQUIRE_AUTH_DB_TESTS turns every missing-DSN or missing-migration
+      # skip in these security fixtures into a hard failure.
+      - name: Test legacy identity migration ownership
+        run: >-
+          go test ./migrations
+          -run '^(TestPluginAuthIdentityHardeningMigrationDB|TestManagedRolesAuthorizationMigrationDefaultsExistingBindingsOffDB)$'
+          -count=1 -v
+
+      - name: Test managed-role binding persistence
+        run: go test ./internal/plugins -run '^TestAuthBindingManagedRolesAuthorizationDB$' -count=1 -v
+
+      - name: Test plugin identity and role transactions
+        run: >-
+          go test ./internal/auth
+          -run '^TestPlugin(ProvisioningConcurrentFirstLoginDB|ManagedRoleSnapshotLifecycleDB|ManagedRoleDemotionWithoutSnapshotUsesFallbackDB|MalformedManagedRoleDoesNotModifyDB|CapabilityNamespacesDoNotRepointIdentityDB|ProvisioningDuplicatePolicyDB)$'
+          -count=1 -v
+
+      - name: Test stale administrator token revocation
+        run: >-
+          go test ./internal/api/middleware
+          -run '^TestManagedRoleDemotionRejectsExistingAdminTokenDB$'
+          -count=1 -v
+
   web:
     name: Web
     runs-on: ubuntu-latest
