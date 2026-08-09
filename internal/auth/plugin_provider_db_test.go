@@ -35,7 +35,13 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
 	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
+	prefix := "plugin-hardening-" + uuid.NewString()
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse test database URL: %v", err)
+	}
+	poolConfig.ConnConfig.RuntimeParams["application_name"] = prefix
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		t.Fatalf("connect test database: %v", err)
 	}
@@ -59,7 +65,6 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 		t.Skip("plugin auth identity hardening migration is not applied")
 	}
 
-	prefix := "plugin-hardening-" + uuid.NewString()
 	var installationID int
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO plugin_installations (plugin_id, version, install_path)
@@ -233,8 +238,9 @@ func TestPluginProvisioningConcurrentFirstLoginDB(t *testing.T) {
 			SELECT count(*)
 			FROM pg_stat_activity
 			WHERE datname = current_database()
+			  AND application_name = $1
 			  AND wait_event_type = 'Lock'
-			  AND query ILIKE '%INSERT INTO plugin_auth_identities%'`).Scan(&waiting); err != nil {
+			  AND query ILIKE '%INSERT INTO plugin_auth_identities%'`, f.prefix).Scan(&waiting); err != nil {
 			t.Fatalf("observe blocked identity claims: %v", err)
 		}
 		if waiting == len(responses) {
