@@ -168,8 +168,16 @@ func (r *SessionRepository) Revoke(ctx context.Context, id string) error {
 
 // RevokeAllByUser sets revoked_at to NOW() for all active sessions owned by a user.
 func (r *SessionRepository) RevokeAllByUser(ctx context.Context, userID int) error {
+	return r.revokeAllByUser(ctx, r.pool, userID)
+}
+
+func (r *SessionRepository) RevokeAllByUserTx(ctx context.Context, tx pgx.Tx, userID int) error {
+	return r.revokeAllByUser(ctx, tx, userID)
+}
+
+func (r *SessionRepository) revokeAllByUser(ctx context.Context, db sessionExecQuerier, userID int) error {
 	query := `UPDATE auth_sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`
-	if _, err := r.pool.Exec(ctx, query, userID); err != nil {
+	if _, err := db.Exec(ctx, query, userID); err != nil {
 		return fmt.Errorf("revoking sessions for user %d: %w", userID, err)
 	}
 	return nil

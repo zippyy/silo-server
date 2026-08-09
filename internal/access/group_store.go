@@ -91,6 +91,10 @@ type groupScanner interface {
 	Scan(dest ...any) error
 }
 
+type groupQueryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 func scanGroup(row groupScanner) (*Group, error) {
 	var g Group
 	if err := row.Scan(
@@ -175,6 +179,31 @@ func (s *GroupStore) Get(ctx context.Context, id int64) (*Group, error) {
 		return nil, fmt.Errorf("loading access group: %w", err)
 	}
 	return group, nil
+}
+
+func (s *GroupStore) DefaultID(ctx context.Context) (*int64, error) {
+	return defaultGroupID(ctx, s.pool)
+}
+
+func (s *GroupStore) DefaultIDTx(ctx context.Context, tx pgx.Tx) (*int64, error) {
+	return defaultGroupID(ctx, tx)
+}
+
+func defaultGroupID(ctx context.Context, db groupQueryRower) (*int64, error) {
+	var id int64
+	err := db.QueryRow(ctx, `
+		SELECT id
+		FROM access_groups
+		WHERE is_default
+		ORDER BY id
+		LIMIT 1`).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading default access group: %w", err)
+	}
+	return &id, nil
 }
 
 // Create inserts a new access group.
