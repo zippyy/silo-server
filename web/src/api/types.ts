@@ -3546,6 +3546,7 @@ export interface PluginAuthBinding {
   display_order: number;
   auto_provision: boolean;
   default_login: boolean;
+  managed_roles_enabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -3678,6 +3679,7 @@ export interface SavePluginAuthBindingRequest {
   display_order: number;
   auto_provision: boolean;
   default_login: boolean;
+  managed_roles_enabled: boolean;
 }
 
 export interface SavePluginTaskBindingRequest {

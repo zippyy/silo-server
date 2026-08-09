@@ -30,14 +30,15 @@ type RuntimeConfig struct {
 }
 
 type AuthBinding struct {
-	InstallationID int
-	CapabilityID   string
-	Enabled        bool
-	DisplayOrder   int
-	AutoProvision  bool
-	DefaultLogin   bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	InstallationID      int
+	CapabilityID        string
+	Enabled             bool
+	DisplayOrder        int
+	AutoProvision       bool
+	DefaultLogin        bool
+	ManagedRolesEnabled bool
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type TaskBinding struct {
@@ -348,13 +349,15 @@ func backfillEncryptedConfigs(
 func (s *RuntimeConfigStore) UpsertAuthBinding(ctx context.Context, binding AuthBinding) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO plugin_auth_bindings (
-			plugin_installation_id, capability_id, enabled, display_order, auto_provision, default_login
-		) VALUES ($1, $2, $3, $4, $5, $6)
+			plugin_installation_id, capability_id, enabled, display_order, auto_provision,
+			default_login, managed_roles_enabled
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (plugin_installation_id, capability_id) DO UPDATE SET
 			enabled = EXCLUDED.enabled,
 			display_order = EXCLUDED.display_order,
 			auto_provision = EXCLUDED.auto_provision,
 			default_login = EXCLUDED.default_login,
+			managed_roles_enabled = EXCLUDED.managed_roles_enabled,
 			updated_at = NOW()
 	`,
 		binding.InstallationID,
@@ -363,6 +366,7 @@ func (s *RuntimeConfigStore) UpsertAuthBinding(ctx context.Context, binding Auth
 		binding.DisplayOrder,
 		binding.AutoProvision,
 		binding.DefaultLogin,
+		binding.ManagedRolesEnabled,
 	)
 	if err != nil {
 		return fmt.Errorf("upserting plugin auth binding: %w", err)
@@ -377,7 +381,8 @@ func (s *RuntimeConfigStore) GetAuthBinding(
 ) (*AuthBinding, error) {
 	var binding AuthBinding
 	err := s.pool.QueryRow(ctx, `
-		SELECT plugin_installation_id, capability_id, enabled, display_order, auto_provision, default_login, created_at, updated_at
+		SELECT plugin_installation_id, capability_id, enabled, display_order, auto_provision,
+		       default_login, managed_roles_enabled, created_at, updated_at
 		FROM plugin_auth_bindings
 		WHERE plugin_installation_id = $1 AND capability_id = $2
 	`, installationID, capabilityID).Scan(
@@ -387,6 +392,7 @@ func (s *RuntimeConfigStore) GetAuthBinding(
 		&binding.DisplayOrder,
 		&binding.AutoProvision,
 		&binding.DefaultLogin,
+		&binding.ManagedRolesEnabled,
 		&binding.CreatedAt,
 		&binding.UpdatedAt,
 	)
@@ -401,7 +407,8 @@ func (s *RuntimeConfigStore) GetAuthBinding(
 
 func (s *RuntimeConfigStore) ListAuthBindings(ctx context.Context) ([]*AuthBinding, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT plugin_installation_id, capability_id, enabled, display_order, auto_provision, default_login, created_at, updated_at
+		SELECT plugin_installation_id, capability_id, enabled, display_order, auto_provision,
+		       default_login, managed_roles_enabled, created_at, updated_at
 		FROM plugin_auth_bindings
 		ORDER BY display_order ASC, plugin_installation_id ASC, capability_id ASC
 	`)
@@ -420,6 +427,7 @@ func (s *RuntimeConfigStore) ListAuthBindings(ctx context.Context) ([]*AuthBindi
 			&binding.DisplayOrder,
 			&binding.AutoProvision,
 			&binding.DefaultLogin,
+			&binding.ManagedRolesEnabled,
 			&binding.CreatedAt,
 			&binding.UpdatedAt,
 		); err != nil {

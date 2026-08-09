@@ -590,32 +590,62 @@ function ConfigureDialog({
                   {authCapabilities.map((capability, index) => {
                     const binding = authBindings.find((e) => e.capability_id === capability.id);
                     return (
-                      <div
-                        key={capability.id}
-                        className="flex items-center justify-between rounded-lg border p-3"
-                      >
-                        <div>
-                          <p className="text-sm font-medium">
-                            {capability.display_name || capability.id}
-                          </p>
-                          <p className="text-muted-foreground font-mono text-xs">{capability.id}</p>
+                      <div key={capability.id} className="space-y-3 rounded-lg border p-3">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-sm font-medium">
+                              {capability.display_name || capability.id}
+                            </p>
+                            <p className="text-muted-foreground font-mono text-xs">
+                              {capability.id}
+                            </p>
+                          </div>
+                          <Switch
+                            checked={binding?.enabled ?? false}
+                            disabled={saveAuthBinding.isPending}
+                            onCheckedChange={(checked) =>
+                              saveAuthBinding.mutate({
+                                id: installation.id,
+                                body: {
+                                  capability_id: capability.id,
+                                  enabled: checked,
+                                  display_order: binding?.display_order ?? index + 1,
+                                  auto_provision: binding?.auto_provision ?? true,
+                                  default_login: binding?.default_login ?? false,
+                                  managed_roles_enabled: binding?.managed_roles_enabled ?? false,
+                                },
+                              })
+                            }
+                          />
                         </div>
-                        <Switch
-                          checked={binding?.enabled ?? false}
-                          disabled={saveAuthBinding.isPending}
-                          onCheckedChange={(checked) =>
-                            saveAuthBinding.mutate({
-                              id: installation.id,
-                              body: {
-                                capability_id: capability.id,
-                                enabled: checked,
-                                display_order: binding?.display_order ?? index + 1,
-                                auto_provision: binding?.auto_provision ?? true,
-                                default_login: binding?.default_login ?? false,
-                              },
-                            })
-                          }
-                        />
+                        {capability.metadata?.managed_role_contract ===
+                          "silo.auth.managed-role.v1" && (
+                          <div className="flex items-center justify-between border-t pt-3">
+                            <div className="pr-4">
+                              <p className="text-sm font-medium">Allow managed Silo roles</p>
+                              <p className="text-muted-foreground text-xs">
+                                Let this provider promote and demote Silo administrators.
+                              </p>
+                            </div>
+                            <Switch
+                              checked={binding?.managed_roles_enabled ?? false}
+                              disabled={saveAuthBinding.isPending || !(binding?.enabled ?? false)}
+                              onCheckedChange={(checked) =>
+                                saveAuthBinding.mutate({
+                                  id: installation.id,
+                                  body: {
+                                    capability_id: capability.id,
+                                    enabled: binding?.enabled ?? false,
+                                    display_order: binding?.display_order ?? index + 1,
+                                    auto_provision: binding?.auto_provision ?? true,
+                                    default_login: binding?.default_login ?? false,
+                                    managed_roles_enabled: checked,
+                                  },
+                                })
+                              }
+                            />
+                          </div>
+                        )}
                       </div>
                     );
                   })}

@@ -41,6 +41,20 @@ func ManagedRoleContractFromMetadata(metadata map[string]any) (string, error) {
 	return contract, nil
 }
 
+// ManagedRoleContractForBinding grants role authority only when both the
+// installed capability advertises the supported contract and the operator has
+// explicitly enabled it on this authentication binding.
+func ManagedRoleContractForBinding(metadata map[string]any, enabled bool) (string, error) {
+	contract, err := ManagedRoleContractFromMetadata(metadata)
+	if err != nil {
+		return "", err
+	}
+	if !enabled {
+		return "", nil
+	}
+	return contract, nil
+}
+
 func managedRoleFromResponse(
 	response *pluginv1.AuthenticateResponse,
 	authorizedContract string,

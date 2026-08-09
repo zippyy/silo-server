@@ -100,11 +100,12 @@ type pluginConfigRequest struct {
 }
 
 type pluginAuthBindingRequest struct {
-	CapabilityID  string `json:"capability_id"`
-	Enabled       bool   `json:"enabled"`
-	DisplayOrder  int    `json:"display_order"`
-	AutoProvision bool   `json:"auto_provision"`
-	DefaultLogin  bool   `json:"default_login"`
+	CapabilityID        string `json:"capability_id"`
+	Enabled             bool   `json:"enabled"`
+	DisplayOrder        int    `json:"display_order"`
+	AutoProvision       bool   `json:"auto_provision"`
+	DefaultLogin        bool   `json:"default_login"`
+	ManagedRolesEnabled bool   `json:"managed_roles_enabled"`
 }
 
 type pluginTaskBindingRequest struct {
@@ -299,13 +300,14 @@ type pluginConfigValueJSON struct {
 }
 
 type pluginAuthBindingJSON struct {
-	CapabilityID  string    `json:"capability_id"`
-	Enabled       bool      `json:"enabled"`
-	DisplayOrder  int       `json:"display_order"`
-	AutoProvision bool      `json:"auto_provision"`
-	DefaultLogin  bool      `json:"default_login"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	CapabilityID        string    `json:"capability_id"`
+	Enabled             bool      `json:"enabled"`
+	DisplayOrder        int       `json:"display_order"`
+	AutoProvision       bool      `json:"auto_provision"`
+	DefaultLogin        bool      `json:"default_login"`
+	ManagedRolesEnabled bool      `json:"managed_roles_enabled"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type pluginTaskBindingJSON struct {
@@ -1083,12 +1085,13 @@ func (h *PluginHandler) HandlePutAuthBinding(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := h.configs.UpsertAuthBinding(r.Context(), plugins.AuthBinding{
-		InstallationID: id,
-		CapabilityID:   req.CapabilityID,
-		Enabled:        req.Enabled,
-		DisplayOrder:   req.DisplayOrder,
-		AutoProvision:  req.AutoProvision,
-		DefaultLogin:   req.DefaultLogin,
+		InstallationID:      id,
+		CapabilityID:        req.CapabilityID,
+		Enabled:             req.Enabled,
+		DisplayOrder:        req.DisplayOrder,
+		AutoProvision:       req.AutoProvision,
+		DefaultLogin:        req.DefaultLogin,
+		ManagedRolesEnabled: req.ManagedRolesEnabled,
 	}); err != nil {
 		slog.ErrorContext(r.Context(), "saving plugin auth binding", "component", "api", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to save auth binding")
@@ -1788,13 +1791,14 @@ func authBindingsForInstallation(installationID int, bindings []*plugins.AuthBin
 			continue
 		}
 		response = append(response, pluginAuthBindingJSON{
-			CapabilityID:  binding.CapabilityID,
-			Enabled:       binding.Enabled,
-			DisplayOrder:  binding.DisplayOrder,
-			AutoProvision: binding.AutoProvision,
-			DefaultLogin:  binding.DefaultLogin,
-			CreatedAt:     binding.CreatedAt,
-			UpdatedAt:     binding.UpdatedAt,
+			CapabilityID:        binding.CapabilityID,
+			Enabled:             binding.Enabled,
+			DisplayOrder:        binding.DisplayOrder,
+			AutoProvision:       binding.AutoProvision,
+			DefaultLogin:        binding.DefaultLogin,
+			ManagedRolesEnabled: binding.ManagedRolesEnabled,
+			CreatedAt:           binding.CreatedAt,
+			UpdatedAt:           binding.UpdatedAt,
 		})
 	}
 	return response

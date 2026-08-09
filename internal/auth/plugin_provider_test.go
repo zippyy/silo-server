@@ -59,6 +59,27 @@ func TestManagedRoleContractFromMetadata(t *testing.T) {
 	}
 }
 
+func TestManagedRoleContractForBindingRequiresOperatorAuthorization(t *testing.T) {
+	metadata := map[string]any{
+		managedRoleContractMetadataKey: ManagedRoleContractV1,
+		managedRoleValuesMetadataKey:   []any{"user", "admin"},
+	}
+	contract, err := ManagedRoleContractForBinding(metadata, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract != "" {
+		t.Fatalf("unauthorized binding received managed-role contract %q", contract)
+	}
+	contract, err = ManagedRoleContractForBinding(metadata, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract != ManagedRoleContractV1 {
+		t.Fatalf("authorized binding contract = %q, want %q", contract, ManagedRoleContractV1)
+	}
+}
+
 func TestManagedRoleFromResponseFailsClosed(t *testing.T) {
 	tests := []struct {
 		name        string

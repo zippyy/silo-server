@@ -2320,7 +2320,10 @@ func main() {
 			if err == nil {
 				for _, capability := range capabilities {
 					if capability != nil && capability.Type == "auth_provider.v1" && capability.ID == binding.CapabilityID {
-						contract, contractErr := auth.ManagedRoleContractFromMetadata(capability.Metadata)
+						contract, contractErr := auth.ManagedRoleContractForBinding(
+							capability.Metadata,
+							binding.ManagedRolesEnabled,
+						)
 						if contractErr != nil {
 							slog.WarnContext(appCtx, "ignoring malformed managed-role advertisement",
 								"component", "auth",
