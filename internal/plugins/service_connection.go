@@ -43,10 +43,6 @@ type pluginConnectionCheckCapability struct {
 
 const (
 	connectionCheckKindMetadata = "metadata_provider"
-	connectionCheckKindAuth     = "auth_provider_request_router"
-
-	authConnectionTestMetadataKey = "connection_test"
-	authConnectionTestConfigKeys  = "connection_test_config_keys"
 )
 
 var runPluginConnectionCheck = func(
@@ -63,26 +59,12 @@ var runPluginConnectionCheck = func(
 	switch capability.kind {
 	case connectionCheckKindMetadata:
 		return runMetadataProviderConnectionCheck(ctx, client, manifest, capability.id)
-	case connectionCheckKindAuth:
-		return runAuthProviderConnectionCheck(ctx, client, capability.id)
 	default:
 		return &ConnectionTestError{
 			Message: "Connection checks are not supported for this plugin yet.",
 			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
-}
-
-var requestRouterConnectionTest = func(
-	ctx context.Context,
-	client pluginClient,
-	capabilityID string,
-) (*pluginv1.TestConnectionResponse, error) {
-	requestRouter, err := client.RequestRouter(capabilityID)
-	if err != nil {
-		return nil, err
-	}
-	return requestRouter.TestConnection(ctx, &pluginv1.TestConnectionRequest{CapabilityId: capabilityID})
 }
 
 func runMetadataProviderConnectionCheck(
@@ -125,30 +107,6 @@ func runMetadataProviderConnectionCheck(
 		}
 	}
 
-	return nil
-}
-
-func runAuthProviderConnectionCheck(
-	ctx context.Context,
-	client pluginClient,
-	capabilityID string,
-) error {
-	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	response, err := requestRouterConnectionTest(probeCtx, client, capabilityID)
-	if err != nil {
-		return &ConnectionTestError{
-			Message: fmt.Sprintf("Connection check failed: %v", err),
-			Cause:   err,
-		}
-	}
-	if response == nil || !response.GetOk() {
-		return &ConnectionTestError{
-			Message: "The authentication provider did not positively acknowledge the connection check.",
-			Cause:   ErrConnectionTestUnsupported,
-		}
-	}
 	return nil
 }
 
@@ -330,19 +288,9 @@ func pluginConnectionCheckCapabilityForManifest(
 	manifest *pluginv1.PluginManifest,
 	configKey string,
 ) (pluginConnectionCheckCapability, error) {
-	authCapabilityID, advertised, err := authProviderConnectionCheckCapabilityID(manifest, configKey)
-	if err != nil {
-		return pluginConnectionCheckCapability{}, err
-	}
-	if authCapabilityID != "" {
-		return pluginConnectionCheckCapability{
-			kind: connectionCheckKindAuth,
-			id:   authCapabilityID,
-		}, nil
-	}
-	if advertised {
+	if manifestHasAuthProvider(manifest) {
 		return pluginConnectionCheckCapability{}, &ConnectionTestError{
-			Message: fmt.Sprintf("No authentication provider owns configuration key %q for connection testing.", configKey),
+			Message: fmt.Sprintf("Authentication-provider connection checks are not supported for configuration key %q yet.", configKey),
 			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
@@ -358,55 +306,13 @@ func pluginConnectionCheckCapabilityForManifest(
 	}
 }
 
-func authProviderConnectionCheckCapabilityID(
-	manifest *pluginv1.PluginManifest,
-	configKey string,
-) (string, bool, error) {
-	matches := make([]string, 0, 1)
-	advertised := false
+func manifestHasAuthProvider(manifest *pluginv1.PluginManifest) bool {
 	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() != "auth_provider.v1" || capability.GetMetadata() == nil {
-			continue
-		}
-		metadata := capability.GetMetadata().AsMap()
-		rawEnabled, hasEnabled := metadata[authConnectionTestMetadataKey]
-		rawKeys, hasKeys := metadata[authConnectionTestConfigKeys]
-		if !hasEnabled && !hasKeys {
-			continue
-		}
-		if enabled, ok := rawEnabled.(bool); ok && !enabled && !hasKeys {
-			continue
-		}
-		advertised = true
-		enabled, ok := rawEnabled.(bool)
-		if !ok || !enabled || !hasKeys {
-			return "", true, malformedAuthConnectionTest(capability.GetId())
-		}
-		keys, ok := stringList(rawKeys)
-		if !ok || len(keys) == 0 {
-			return "", true, malformedAuthConnectionTest(capability.GetId())
-		}
-		if !slicesContain(keys, configKey) {
-			continue
-		}
-		if !manifestHasCapability(manifest, "request_router.v1", capability.GetId()) {
-			return "", true, &ConnectionTestError{
-				Message: fmt.Sprintf("Authentication provider %q advertises connection testing without a matching request_router.v1 capability.", capability.GetId()),
-				Cause:   ErrConnectionTestUnsupported,
-			}
-		}
-		matches = append(matches, capability.GetId())
-	}
-	if len(matches) > 1 {
-		return "", true, &ConnectionTestError{
-			Message: fmt.Sprintf("Multiple authentication providers own configuration key %q for connection testing.", configKey),
-			Cause:   ErrConnectionTestUnsupported,
+		if capability.GetType() == "auth_provider.v1" {
+			return true
 		}
 	}
-	if len(matches) == 1 {
-		return matches[0], true, nil
-	}
-	return "", advertised, nil
+	return false
 }
 
 func metadataProviderConnectionCheckCapabilityID(manifest *pluginv1.PluginManifest) (string, error) {
@@ -430,52 +336,6 @@ func metadataProviderConnectionCheckCapabilityID(manifest *pluginv1.PluginManife
 		Message: "Connection checks are not supported for this plugin yet.",
 		Cause:   ErrConnectionTestUnsupported,
 	}
-}
-
-func malformedAuthConnectionTest(capabilityID string) error {
-	return &ConnectionTestError{
-		Message: fmt.Sprintf("Authentication provider %q has malformed connection-test metadata.", capabilityID),
-		Cause:   ErrConnectionTestUnsupported,
-	}
-}
-
-func manifestHasCapability(manifest *pluginv1.PluginManifest, capabilityType, capabilityID string) bool {
-	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() == capabilityType && capability.GetId() == capabilityID {
-			return true
-		}
-	}
-	return false
-}
-
-func stringList(value any) ([]string, bool) {
-	raw, ok := value.([]any)
-	if !ok {
-		return nil, false
-	}
-	result := make([]string, 0, len(raw))
-	seen := make(map[string]struct{}, len(raw))
-	for _, item := range raw {
-		text, ok := item.(string)
-		if !ok || strings.TrimSpace(text) == "" || text != strings.TrimSpace(text) {
-			return nil, false
-		}
-		if _, duplicate := seen[text]; duplicate {
-			return nil, false
-		}
-		seen[text] = struct{}{}
-		result = append(result, text)
-	}
-	return result, true
-}
-
-func slicesContain(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func metadataProviderConnectionCheckCapability(
