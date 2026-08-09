@@ -20,6 +20,19 @@ var (
 	ErrDuplicate = errors.New("duplicate user")
 )
 
+type DuplicateError struct {
+	Constraint string
+}
+
+func (e *DuplicateError) Error() string {
+	if e == nil || e.Constraint == "" {
+		return ErrDuplicate.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrDuplicate, e.Constraint)
+}
+
+func (e *DuplicateError) Unwrap() error { return ErrDuplicate }
+
 // IsNotFound returns true if the error is a "not found" error.
 func IsNotFound(err error) bool {
 	return errors.Is(err, ErrNotFound)
@@ -28,6 +41,14 @@ func IsNotFound(err error) bool {
 // IsDuplicate returns true if the error is a "duplicate" error.
 func IsDuplicate(err error) bool {
 	return errors.Is(err, ErrDuplicate)
+}
+
+func DuplicateConstraint(err error) string {
+	var duplicate *DuplicateError
+	if errors.As(err, &duplicate) {
+		return duplicate.Constraint
+	}
+	return ""
 }
 
 // CheckPassword verifies a plaintext password against the user's bcrypt hash.
@@ -40,6 +61,15 @@ func CheckPassword(user *models.User, password string) bool {
 // UserRepository provides CRUD operations for the users table.
 type UserRepository struct {
 	pool *pgxpool.Pool
+}
+
+type userQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+type userExecQuerier interface {
+	userQuerier
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
 // NewUserRepository creates a new UserRepository backed by the given pool.
@@ -130,6 +160,14 @@ func scanUsers(rows pgx.Rows) ([]*models.User, error) {
 
 // Create inserts a new user with a bcrypt-hashed password and returns the created user.
 func (r *UserRepository) Create(ctx context.Context, input models.CreateUserInput) (*models.User, error) {
+	return r.create(ctx, r.pool, input)
+}
+
+func (r *UserRepository) CreateTx(ctx context.Context, tx pgx.Tx, input models.CreateUserInput) (*models.User, error) {
+	return r.create(ctx, tx, input)
+}
+
+func (r *UserRepository) create(ctx context.Context, db userQuerier, input models.CreateUserInput) (*models.User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("hashing password: %w", err)
@@ -215,12 +253,12 @@ func (r *UserRepository) Create(ctx context.Context, input models.CreateUserInpu
 		allColumns,
 	)
 
-	row := r.pool.QueryRow(ctx, query, args...)
+	row := db.QueryRow(ctx, query, args...)
 
 	user, err := scanUser(row)
 	if err != nil {
 		if isDuplicateKeyError(err) {
-			return nil, fmt.Errorf("%w: %s", ErrDuplicate, extractConstraint(err))
+			return nil, &DuplicateError{Constraint: extractConstraint(err)}
 		}
 		return nil, fmt.Errorf("creating user: %w", err)
 	}
@@ -230,8 +268,19 @@ func (r *UserRepository) Create(ctx context.Context, input models.CreateUserInpu
 
 // GetByID retrieves a user by their numeric ID.
 func (r *UserRepository) GetByID(ctx context.Context, id int) (*models.User, error) {
+	return r.getByID(ctx, r.pool, id, false)
+}
+
+func (r *UserRepository) GetByIDTx(ctx context.Context, tx pgx.Tx, id int, forUpdate bool) (*models.User, error) {
+	return r.getByID(ctx, tx, id, forUpdate)
+}
+
+func (r *UserRepository) getByID(ctx context.Context, db userQuerier, id int, forUpdate bool) (*models.User, error) {
 	query := `SELECT ` + allColumns + ` FROM users WHERE id = $1`
-	return scanUser(r.pool.QueryRow(ctx, query, id))
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	return scanUser(db.QueryRow(ctx, query, id))
 }
 
 // GetByUsername retrieves a user by their username (case-insensitive).
@@ -249,6 +298,14 @@ func (r *UserRepository) GetByEmail(ctx context.Context, email string) (*models.
 // Update modifies a user's fields. Only non-nil fields in the input are updated.
 // If the input contains a Password, it is bcrypt-hashed before storage.
 func (r *UserRepository) Update(ctx context.Context, id int, input models.UpdateUserInput) error {
+	return r.update(ctx, r.pool, id, input)
+}
+
+func (r *UserRepository) UpdateTx(ctx context.Context, tx pgx.Tx, id int, input models.UpdateUserInput) error {
+	return r.update(ctx, tx, id, input)
+}
+
+func (r *UserRepository) update(ctx context.Context, db userExecQuerier, id int, input models.UpdateUserInput) error {
 	setClauses := []string{}
 	accessPolicyPredicates := []string{}
 	args := []any{}
@@ -356,8 +413,7 @@ func (r *UserRepository) Update(ctx context.Context, id int, input models.Update
 	}
 
 	if len(setClauses) == 0 {
-		// Nothing to update; still verify the user exists.
-		_, err := r.GetByID(ctx, id)
+		_, err := r.getByID(ctx, db, id, false)
 		return err
 	}
 
@@ -375,10 +431,10 @@ func (r *UserRepository) Update(ctx context.Context, id int, input models.Update
 		strings.Join(setClauses, ", "), argIndex)
 	args = append(args, id)
 
-	tag, err := r.pool.Exec(ctx, query, args...)
+	tag, err := db.Exec(ctx, query, args...)
 	if err != nil {
 		if isDuplicateKeyError(err) {
-			return fmt.Errorf("%w: %s", ErrDuplicate, extractConstraint(err))
+			return &DuplicateError{Constraint: extractConstraint(err)}
 		}
 		return fmt.Errorf("updating user: %w", err)
 	}
