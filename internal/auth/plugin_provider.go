@@ -228,7 +228,7 @@ func (p *PluginProvider) autoProvisionUser(
 		Username:                  usernameBase,
 		Password:                  password,
 		LocalPasswordLoginEnabled: &localPasswordLoginEnabled,
-		Role:                      "user",
+		Role:                      managedRoleUser,
 	}, key)
 	if err != nil {
 		if errors.Is(err, errProvisioningEmailCollision) {
@@ -383,8 +383,8 @@ func (p *PluginProvider) applyManagedRoleTx(
 	desiredRole string,
 ) (*models.User, roleTransition, error) {
 	transition := roleTransition{previous: user.Role, next: desiredRole}
-	if desiredRole == "admin" {
-		if user.Role == "admin" {
+	if desiredRole == managedRoleAdmin {
+		if user.Role == managedRoleAdmin {
 			return user, transition, nil
 		}
 		if !identity.SnapshotPresent {
@@ -394,7 +394,7 @@ func (p *PluginProvider) applyManagedRoleTx(
 				return nil, transition, err
 			}
 		}
-		role := "admin"
+		role := managedRoleAdmin
 		if err := p.users.UpdateTx(ctx, tx, user.ID, models.UpdateUserInput{
 			Role:             &role,
 			AccessGroupIDSet: true,
@@ -403,7 +403,7 @@ func (p *PluginProvider) applyManagedRoleTx(
 		}
 		transition.changed = true
 	} else {
-		if user.Role == "user" && !identity.SnapshotPresent {
+		if user.Role == managedRoleUser && !identity.SnapshotPresent {
 			return user, transition, nil
 		}
 		permissions := identity.SnapshotPermissions
@@ -416,7 +416,7 @@ func (p *PluginProvider) applyManagedRoleTx(
 				return nil, transition, err
 			}
 		}
-		role := "user"
+		role := managedRoleUser
 		if err := p.users.UpdateTx(ctx, tx, user.ID, models.UpdateUserInput{
 			Role:             &role,
 			Permissions:      &permissions,
@@ -436,7 +436,7 @@ func (p *PluginProvider) applyManagedRoleTx(
 		if err := p.sessions.RevokeAllByUserTx(ctx, tx, user.ID); err != nil {
 			return nil, transition, fmt.Errorf("revoke demoted administrator sessions: %w", err)
 		}
-		transition.changed = user.Role != "user" || identity.SnapshotPresent
+		transition.changed = user.Role != managedRoleUser || identity.SnapshotPresent
 	}
 	updated, err := p.users.GetByIDTx(ctx, tx, user.ID, false)
 	if err != nil {

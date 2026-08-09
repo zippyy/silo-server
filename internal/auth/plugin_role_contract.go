@@ -8,6 +8,8 @@ import (
 
 const (
 	ManagedRoleContractV1 = "silo.auth.managed-role.v1"
+	managedRoleUser       = "user"
+	managedRoleAdmin      = "admin"
 
 	managedRoleContractMetadataKey = "managed_role_contract"
 	managedRoleValuesMetadataKey   = "role_values"
@@ -30,10 +32,10 @@ func ManagedRoleContractFromMetadata(metadata map[string]any) (string, error) {
 	if !ok || len(values) != 2 {
 		return "", fmt.Errorf("managed-role contract must advertise exactly user and admin")
 	}
-	if _, ok := values["user"]; !ok {
+	if _, ok := values[managedRoleUser]; !ok {
 		return "", fmt.Errorf("managed-role contract does not advertise user")
 	}
-	if _, ok := values["admin"]; !ok {
+	if _, ok := values[managedRoleAdmin]; !ok {
 		return "", fmt.Errorf("managed-role contract does not advertise admin")
 	}
 	return contract, nil
@@ -66,7 +68,7 @@ func managedRoleFromResponse(
 		return "", false, fmt.Errorf("plugin managed-role response uses an unsupported contract")
 	}
 	role, ok := claims[managedRoleClaimKey].(string)
-	if !ok || (role != "user" && role != "admin") {
+	if !ok || (role != managedRoleUser && role != managedRoleAdmin) {
 		return "", false, fmt.Errorf("plugin managed-role response contains an unsupported role")
 	}
 	return role, true, nil
