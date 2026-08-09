@@ -1,6 +1,10 @@
 package auth
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"log/slog"
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
@@ -112,6 +116,53 @@ func TestProvisionedFallbackEmailUsesStableIdentityNamespace(t *testing.T) {
 	}
 	if first != provisionedEmail(response, PluginIdentityKey{InstallationID: 7, CapabilityID: "ldap", ExternalSubject: response.ExternalSubject}) {
 		t.Fatal("fallback email is not stable")
+	}
+}
+
+func TestManagedRoleTransitionAuditLog(t *testing.T) {
+	var output bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	provider := &PluginProvider{config: PluginProviderConfig{
+		InstallationID: 42,
+		CapabilityID:   "ldap",
+	}}
+	provider.logRoleTransition(context.Background(), 73, roleTransition{
+		previous: managedRoleUser,
+		next:     managedRoleAdmin,
+		changed:  true,
+	})
+
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("decode audit log: %v", err)
+	}
+	want := map[string]any{
+		"msg":                    "plugin-managed user role changed",
+		"component":              "auth",
+		"plugin_installation_id": float64(42),
+		"capability_id":          "ldap",
+		"user_id":                float64(73),
+		"previous_role":          managedRoleUser,
+		"new_role":               managedRoleAdmin,
+		"contract":               ManagedRoleContractV1,
+	}
+	for key, expected := range want {
+		if record[key] != expected {
+			t.Errorf("audit field %q = %#v, want %#v", key, record[key], expected)
+		}
+	}
+
+	output.Reset()
+	provider.logRoleTransition(context.Background(), 73, roleTransition{
+		previous: managedRoleAdmin,
+		next:     managedRoleAdmin,
+		changed:  true,
+	})
+	if output.Len() != 0 {
+		t.Fatalf("unchanged role emitted an audit record: %s", output.String())
 	}
 }
 
