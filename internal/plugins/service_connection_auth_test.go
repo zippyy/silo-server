@@ -16,20 +16,20 @@ func TestPluginConnectionCheckRejectsAuthProviderConfig(t *testing.T) {
 		{
 			name: "single auth provider",
 			capabilities: []*pluginv1.CapabilityDescriptor{
-				{Type: "auth_provider.v1", Id: "ldap"},
+				{Type: authProviderCapabilityType, Id: "ldap"},
 			},
 		},
 		{
 			name: "multiple auth providers do not select by order",
 			capabilities: []*pluginv1.CapabilityDescriptor{
-				{Type: "auth_provider.v1", Id: "ldap"},
-				{Type: "auth_provider.v1", Id: "oidc"},
+				{Type: authProviderCapabilityType, Id: "ldap"},
+				{Type: authProviderCapabilityType, Id: "oidc"},
 			},
 		},
 		{
 			name: "metadata provider is not an auth fallback",
 			capabilities: []*pluginv1.CapabilityDescriptor{
-				{Type: "auth_provider.v1", Id: "ldap"},
+				{Type: authProviderCapabilityType, Id: "ldap"},
 				{Type: "metadata_provider.v1", Id: "metadata"},
 			},
 		},
@@ -77,5 +77,5 @@ func authCapabilityWithMetadata(t *testing.T, metadata map[string]any) *pluginv1
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &pluginv1.CapabilityDescriptor{Type: "auth_provider.v1", Id: "ldap", Metadata: value}
+	return &pluginv1.CapabilityDescriptor{Type: authProviderCapabilityType, Id: "ldap", Metadata: value}
 }

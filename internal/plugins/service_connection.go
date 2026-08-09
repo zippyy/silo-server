@@ -43,6 +43,7 @@ type pluginConnectionCheckCapability struct {
 
 const (
 	connectionCheckKindMetadata = "metadata_provider"
+	authProviderCapabilityType  = "auth_provider.v1"
 )
 
 var runPluginConnectionCheck = func(
@@ -308,7 +309,7 @@ func pluginConnectionCheckCapabilityForManifest(
 
 func manifestHasAuthProvider(manifest *pluginv1.PluginManifest) bool {
 	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() == "auth_provider.v1" {
+		if capability.GetType() == authProviderCapabilityType {
 			return true
 		}
 	}
