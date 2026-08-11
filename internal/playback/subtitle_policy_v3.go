@@ -18,18 +18,28 @@ type SubtitlePolicyResultV3 struct {
 	Terminal             *TerminalV3
 }
 
+// SubtitleInventoryEntryV3 is one subtitle track that exists for the file but
+// is not carried on models.MediaFile — today, downloaded and AI-generated
+// tracks. Callers supply them in the order that defines their ordinals (see
+// BuildSubtitleInventoryV3); CombinedIndex records the ordinal each entry was
+// assigned so a caller holding an entry alone can still address it.
 type SubtitleInventoryEntryV3 struct {
 	CombinedIndex        int
 	Codec                string
 	Source               string
-	DownloadedSubtitleID int
+	Language             string
+	Label                string
+	Forced               bool
+	HearingImpaired      bool
+	DownloadedSubtitleID int `json:"-"`
 }
 
 // ResolveSubtitlePolicyV3 decides how the selected subtitle is delivered when
-// the plan executes on the given engine. Renderability is engine-specific, so
-// callers must resolve the policy against the engine that will actually run
-// the plan rather than assuming the direct engine's capabilities.
-func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, engine EngineV3, additional []SubtitleInventoryEntryV3) SubtitlePolicyResultV3 {
+// the plan executes on the given delivery class. Renderability is
+// delivery-specific, so callers must resolve the policy against the delivery
+// class that will actually run the plan rather than assuming the
+// original_http capabilities.
+func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, transcodeAllowed bool, deliveryClass string, additional []SubtitleInventoryEntryV3) SubtitlePolicyResultV3 {
 	index := -1
 	if request.SubtitleTrackIndex != nil {
 		index = *request.SubtitleTrackIndex
@@ -56,7 +66,7 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	if source == "embedded" {
 		transportIndex = index - len(file.ExternalSubtitles)
 	}
-	engineCaps := request.ClientPlaybackContext.Engines[string(engine)]
+	deliveryCaps := request.ClientPlaybackContext.Deliveries[deliveryClass]
 	text := isTextSubtitleV3(codec)
 	ass := IsASS(codec)
 	clientBitmap := isClientRenderableBitmapSubtitleV3(codec)
@@ -68,14 +78,14 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 		return subtitleTerminalV3("subtitle_codec_unsupported", fmt.Sprintf("Subtitle format %s has no validated rendering or burn-in route.", codec))
 	}
 	if text {
-		renderable := source != "embedded" && engineCaps.Subtitles.SidecarText || source == "embedded" && engineCaps.Subtitles.EmbeddedText
+		renderable := source != "embedded" && deliveryCaps.Subtitles.SidecarText || source == "embedded" && deliveryCaps.Subtitles.EmbeddedText
 		if ass && request.SubtitleFidelityPreference == SubtitleFidelityPreserveV3 {
-			renderable = renderable && engineCaps.Subtitles.ASSStyling && engineCaps.Subtitles.FontAttachments
+			renderable = renderable && deliveryCaps.Subtitles.ASSStyling && deliveryCaps.Subtitles.FontAttachments
 		}
 		if renderable {
 			return SubtitlePolicyResultV3{
 				Decision:      SubtitleDecisionV3{Mode: SubtitleRenderV3, TrackID: trackID},
-				Claims:        SubtitleClaimsV3{ASSStylingPreserved: !ass || engineCaps.Subtitles.ASSStyling, Reason: "client_render_supported"},
+				Claims:        SubtitleClaimsV3{ASSStylingPreserved: !ass || deliveryCaps.Subtitles.ASSStyling, Reason: "client_render_supported"},
 				SelectedIndex: index, TransportIndex: transportIndex, Codec: codec, Source: source,
 				DownloadedSubtitleID: entry.DownloadedSubtitleID,
 			}
@@ -95,7 +105,7 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	// client-renderable representation at all, so promising a sidecar for
 	// anything broader publishes an artifact URL that always fails at fetch.
 	// Everything else falls through to burn-in or its terminal.
-	if clientBitmap && source == "embedded" && IsPGS(codec) && engineCaps.Subtitles.EmbeddedBitmap {
+	if clientBitmap && source == "embedded" && IsPGS(codec) && deliveryCaps.Subtitles.EmbeddedBitmap {
 		return SubtitlePolicyResultV3{
 			Decision:      SubtitleDecisionV3{Mode: SubtitleRenderV3, TrackID: trackID},
 			Claims:        SubtitleClaimsV3{BitmapSidecar: true, Reason: "client_bitmap_render_supported"},
@@ -117,7 +127,13 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	return subtitleTerminalV3("subtitle_conversion_unsupported", fmt.Sprintf("Subtitle format %s cannot meet the selected fidelity policy.", codec))
 }
 
+// subtitleEntryAtCombinedIndexV3 resolves a combined ordinal through the same
+// three inventory ranges the plan publishes while retaining the stable row ID
+// of a downloaded subtitle for frozen seek recipes.
 func subtitleEntryAtCombinedIndexV3(file *models.MediaFile, index int, additional []SubtitleInventoryEntryV3) (SubtitleInventoryEntryV3, bool) {
+	if file == nil || index < 0 {
+		return SubtitleInventoryEntryV3{}, false
+	}
 	if index < len(file.ExternalSubtitles) {
 		return SubtitleInventoryEntryV3{CombinedIndex: index, Codec: normalizeCodecV3(file.ExternalSubtitles[index].Format), Source: "external"}, true
 	}
@@ -145,14 +161,9 @@ func isTextSubtitleV3(codec string) bool {
 }
 
 func isClientRenderableBitmapSubtitleV3(codec string) bool {
-	switch normalizeCodecV3(codec) {
-	// pgssub, dvdsub, and dvbsub are ffmpeg's short aliases for the same
-	// bitstreams; scanners and older rows record either spelling.
-	case "pgs", "pgssub", "hdmv_pgs_subtitle", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "vobsub":
-		return true
-	default:
-		return false
-	}
+	// normalizeCodecV3 centralizes the short spellings carried by older rows;
+	// the bitmap policy can then use the same canonical set as burn-in.
+	return NeedsBurnIn(codec)
 }
 
 func subtitleTerminalV3(reason, message string) SubtitlePolicyResultV3 {

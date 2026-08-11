@@ -29,6 +29,7 @@ type Claims struct {
 	AudioCodec           string `json:"ac,omitempty"`
 	AudioChannels        int    `json:"ach,omitempty"`
 	AudioTrackIndex      int    `json:"ati,omitempty"`
+	AudioOnly            bool   `json:"ao,omitempty"`
 	// DVProfile is the file's Dolby Vision profile (0 = none); remux nodes
 	// use it to strip dangling profile 7 RPUs. Absent in older tokens, which
 	// decodes as 0 (no strip — the pre-existing behavior).
@@ -47,6 +48,9 @@ type Claims struct {
 	// former playback.RecipeCard. Zero for direct/remux tokens, which reconstruct
 	// from identity alone plus the client-supplied position.
 	SourceVideoCodec       string  `json:"svc,omitempty"`
+	SourceVideoProfile     string  `json:"svp,omitempty"`
+	SourceVideoBitDepth    int     `json:"svb,omitempty"`
+	SoftwareVideoDecode    bool    `json:"svd,omitempty"`
 	VideoBitstreamFilter   string  `json:"vbsf,omitempty"`
 	OutputSubdir           string  `json:"osd,omitempty"`
 	SeekSeconds            float64 `json:"seek,omitempty"`
@@ -61,6 +65,8 @@ type Claims struct {
 	TotalDuration          float64 `json:"dur,omitempty"`
 	FastStart              bool    `json:"fs,omitempty"`
 	TargetCodecAudio       string  `json:"tca,omitempty"`
+	TargetAudioChannels    int     `json:"tac,omitempty"`
+	TargetAudioBitrateKbps int     `json:"tabr,omitempty"`
 
 	// Recipe staleness hint, bumped on each re-mint after a recipe mutation
 	// (audio/quality/seek switch). An optional client-side hint only.

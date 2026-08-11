@@ -44,7 +44,7 @@ func ffmpegBinary() string {
 // probes must resolve through this same function so a feature advertised at
 // planning time is guaranteed present in the binary that later runs.
 func ResolveFFmpegPath(configured string) string {
-	if strings.TrimSpace(configured) != "" {
+	if configured = strings.TrimSpace(configured); configured != "" {
 		return configured
 	}
 	return ffmpegBinary()
@@ -118,7 +118,11 @@ const (
 // the RPUs would dangle — stripping yields a clean HDR10 base layer (the
 // Apple-parity fallback for devices without a P7 decoder). Profile 8 RPUs
 // stay: the base layer is self-contained and DV clients can render it.
-func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagDVSampleEntry bool) []string {
+func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagDVSampleEntry, audioOnly bool) []string {
+	return buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, tagDVSampleEntry, audioOnly, 0, 0)
+}
+
+func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagDVSampleEntry, audioOnly bool, targetAudioChannels, targetAudioBitrateKbps int) []string {
 	args := []string{
 		"-nostdin",
 		"-hide_banner",
@@ -153,8 +157,14 @@ func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcod
 		"-map_chapters", "-1",
 	)
 
-	// Select specific video and audio streams.
-	args = append(args, "-map", "0:v:0")
+	// A planned video remux must fail if the promised video stream disappeared
+	// or became unreadable. Only positively identified audio-only media may
+	// make the video map optional.
+	videoMap := "0:V:0"
+	if audioOnly {
+		videoMap += "?"
+	}
+	args = append(args, "-map", videoMap)
 	if audioTrackIndex >= 0 {
 		args = append(args, "-map", fmt.Sprintf("0:a:%d?", audioTrackIndex))
 	} else {
@@ -175,7 +185,8 @@ func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcod
 	}
 
 	if transcodeAudio {
-		// Video copy + stereo AAC encode is effectively single-threaded work.
+		channels, bitrateKbps := resolvedAACOutputV3(targetAudioChannels, targetAudioBitrateKbps)
+		// Video copy + AAC encode is effectively single-threaded work.
 		// ffmpeg's default auto-threading spawns one filter thread per CPU
 		// core for the implicit downmix/resampler, all idle. Pin to one.
 		args = append(args,
@@ -184,8 +195,8 @@ func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcod
 			"-filter_complex_threads", "1",
 			"-c:v", "copy",
 			"-c:a", "aac",
-			"-ac", "2",
-			"-b:a", "192k",
+			"-ac", strconv.Itoa(channels),
+			"-b:a", strconv.Itoa(bitrateKbps)+"k",
 		)
 	} else {
 		args = append(args, "-c", "copy")
@@ -220,6 +231,10 @@ func StartRemux(ctx context.Context, filePath, outputFormat string, seekSeconds 
 // v3 callers must pass the configured playback path so the strip capability
 // promised by the planner's probe holds for the binary that actually runs.
 func StartRemuxWithDVMode(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string) (*RemuxSession, error) {
+	return startRemuxWithOptions(ctx, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, false, 0, 0)
+}
+
+func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string, audioOnly bool, targetAudioChannels, targetAudioBitrateKbps int) (*RemuxSession, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	bin := ResolveFFmpegPath(ffmpegPath)
@@ -270,7 +285,7 @@ func StartRemuxWithDVMode(ctx context.Context, filePath, outputFormat string, se
 		cancel()
 		return nil, fmt.Errorf("unknown remux Dolby Vision mode %q", mode)
 	}
-	args := buildRemuxArgs(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, effectiveProfile, tagDVSampleEntry)
+	args := buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, effectiveProfile, tagDVSampleEntry, audioOnly, targetAudioChannels, targetAudioBitrateKbps)
 	cmd := exec.CommandContext(ctx, bin, args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -321,18 +336,52 @@ func containerMIME(format string) string {
 	}
 }
 
+// RemuxServeOptions carries the optional serving concerns that not every
+// caller sets, keeping the positional argument list from growing further.
+type RemuxServeOptions struct {
+	// DVMode is the explicitly declared Dolby Vision recipe. The zero value
+	// decodes as the legacy auto behavior, matching old stream tokens.
+	DVMode RemuxDVMode
+	// FFmpegPath selects the binary to execute (empty = global discovery).
+	FFmpegPath string
+	// ContentType overrides the container-derived response type. Audio-only
+	// sources mux an audio-only fMP4, which must not be announced as video.
+	ContentType string
+	// AudioOnly permits the otherwise-mandatory video map to be absent.
+	AudioOnly bool
+	// TargetAudioChannels and TargetAudioBitrateKbps freeze the planned AAC
+	// output. Zero values retain the historical stereo 192 kbps behavior.
+	TargetAudioChannels    int
+	TargetAudioBitrateKbps int
+}
+
+// RemuxContentType returns the override required for an audio-only fMP4.
+func RemuxContentType(audioOnly bool) string {
+	if audioOnly {
+		return AudioOnlyRemuxMIMEV3
+	}
+	return ""
+}
+
 // ServeRemux streams a remuxed file to the HTTP response.
 // It starts an ffmpeg remux session and copies the output directly to the
 // response writer. The response is streamed (chunked transfer) since the
 // total size is not known in advance.
 // When transcodeAudio is true, audio is transcoded to AAC while video is copied.
 func ServeRemux(w http.ResponseWriter, r *http.Request, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int) error {
-	return ServeRemuxWithDVMode(w, r, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, RemuxDVLegacyAutoV3, "")
+	return ServeRemuxWithOptions(w, r, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, RemuxServeOptions{})
 }
 
 // ServeRemuxWithDVMode streams an explicitly declared Dolby Vision recipe.
 // ffmpegPath selects the binary to execute (empty = process-global discovery).
 func ServeRemuxWithDVMode(w http.ResponseWriter, r *http.Request, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string) error {
+	return ServeRemuxWithOptions(w, r, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, RemuxServeOptions{DVMode: mode, FFmpegPath: ffmpegPath})
+}
+
+// ServeRemuxWithOptions is the full remux transport, taking its optional
+// serving concerns as a struct.
+func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, opts RemuxServeOptions) error {
+	mode, ffmpegPath := opts.DVMode, opts.FFmpegPath
 	// Remux output streams for the length of the title; roll the write
 	// deadline with progress instead of the server's absolute WriteTimeout.
 	w = httpstream.NewRollingDeadlineWriter(w)
@@ -348,14 +397,18 @@ func ServeRemuxWithDVMode(w http.ResponseWriter, r *http.Request, filePath, outp
 		return err
 	}
 
-	session, err := StartRemuxWithDVMode(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath)
+	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
 	if err != nil {
 		http.Error(w, "failed to start remux", http.StatusInternalServerError)
 		return err
 	}
 	defer session.Close()
 
-	w.Header().Set("Content-Type", containerMIME(outputFormat))
+	contentType := opts.ContentType
+	if contentType == "" {
+		contentType = containerMIME(outputFormat)
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 

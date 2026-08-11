@@ -9,9 +9,9 @@ func TestExecutableRecipeV3RoundTripPreservesOperationalFields(t *testing.T) {
 	plan := &PlanV3{PlanID: "plan:frozen", Delivery: DeliveryRemuxHLSV3}
 	want := PlannerResultV3{
 		Plan: plan, PlayMethod: PlayRemux, TranscodeAudio: true,
-		TargetVideoCodec: "copy", TargetAudioCodec: "aac", TargetAudioChannels: 6,
+		TargetVideoCodec: "copy", TargetAudioCodec: "aac", TargetAudioChannels: 6, TargetAudioBitrateKbps: 320,
 		TargetResolution: "1080p", TargetBitrateKbps: 18_000,
-		FrozenSourceMetadata: &SourceExecutionMetadataV3{VideoCodec: "hevc", DurationSeconds: 7_201},
+		FrozenSourceMetadata: &SourceExecutionMetadataV3{VideoCodec: "h264", SoftwareVideoDecode: true, DurationSeconds: 7_201},
 		SubtitleTrackIndex:   4, SubtitleTransportTrackIndex: 2,
 		SubtitleBurnIn: true, SubtitleCodec: "hdmv_pgs_subtitle", DownloadedSubtitleID: 71,
 	}
@@ -30,11 +30,11 @@ func TestExecutableRecipeV3RoundTripPreservesOperationalFields(t *testing.T) {
 	got := recipe.PlannerResult(plan)
 	if got.Plan != plan || got.PlayMethod != want.PlayMethod || got.TranscodeAudio != want.TranscodeAudio ||
 		got.TargetVideoCodec != want.TargetVideoCodec || got.TargetAudioCodec != want.TargetAudioCodec ||
-		got.TargetAudioChannels != want.TargetAudioChannels || got.TargetResolution != want.TargetResolution ||
+		got.TargetAudioChannels != want.TargetAudioChannels || got.TargetAudioBitrateKbps != want.TargetAudioBitrateKbps || got.TargetResolution != want.TargetResolution ||
 		got.TargetBitrateKbps != want.TargetBitrateKbps || got.SubtitleTrackIndex != want.SubtitleTrackIndex ||
 		got.SubtitleTransportTrackIndex != want.SubtitleTransportTrackIndex || got.SubtitleBurnIn != want.SubtitleBurnIn ||
 		got.SubtitleCodec != want.SubtitleCodec || got.DownloadedSubtitleID != want.DownloadedSubtitleID || got.FrozenSourceMetadata == nil ||
-		got.FrozenSourceMetadata.VideoCodec != want.FrozenSourceMetadata.VideoCodec || got.FrozenSourceMetadata.DurationSeconds != want.FrozenSourceMetadata.DurationSeconds {
+		got.FrozenSourceMetadata.VideoCodec != want.FrozenSourceMetadata.VideoCodec || got.FrozenSourceMetadata.SoftwareVideoDecode != want.FrozenSourceMetadata.SoftwareVideoDecode || got.FrozenSourceMetadata.DurationSeconds != want.FrozenSourceMetadata.DurationSeconds {
 		t.Fatalf("thawed result = %#v, want %#v", got, want)
 	}
 }
@@ -43,7 +43,7 @@ func TestExecutableRecipeV3SurvivesJSONRoundTrip(t *testing.T) {
 	plan := &PlanV3{PlanID: "plan:frozen"}
 	recipe := FreezeExecutableRecipeV3(PlannerResultV3{
 		Plan: plan, PlayMethod: PlayRemux,
-		FrozenSourceMetadata: &SourceExecutionMetadataV3{VideoCodec: "hevc", DurationSeconds: 7_201},
+		FrozenSourceMetadata: &SourceExecutionMetadataV3{VideoCodec: "h264", SoftwareVideoDecode: true, DurationSeconds: 7_201},
 		SubtitleTrackIndex:   -1, SubtitleTransportTrackIndex: 0,
 	})
 	recipe.SubtitleSource = SubtitleSourceDownloadedV3

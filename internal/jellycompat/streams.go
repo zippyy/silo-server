@@ -133,7 +133,10 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(*source); ok {
 			audioTrackIndex = resolvedAudioTrackIndex
 		}
-		_ = playback.ServeRemux(w, r, file.FilePath, "mp4", seekSeconds, source.TranscodeAudio, audioTrackIndex, file.PrimaryDVProfile())
+		_ = playback.ServeRemuxWithOptions(w, r, file.FilePath, "mp4", seekSeconds, source.TranscodeAudio, audioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
+			ContentType: playback.RemuxContentType(file.IsAudioOnly()),
+			AudioOnly:   file.IsAudioOnly(),
+		})
 	default:
 		_ = playback.ServeDirectPlay(w, r, file.FilePath)
 	}
@@ -917,6 +920,13 @@ func (h *PlaybackHandler) cleanupPlaySession(
 	h.syncSessionsNow(context.WithoutCancel(ctx), "compat_stop")
 }
 
+// The compat transcode ladder always lands on H.264/AAC; these name the
+// target codecs the Jellyfin-compat pipeline hands to ffmpeg.
+const (
+	compatTargetVideoCodec = "h264"
+	compatTargetAudioCodec = "aac"
+)
+
 const (
 	compatTerminalClaimLease           = 10 * time.Second
 	compatTerminalInitialRetryDelay    = 250 * time.Millisecond
@@ -1630,6 +1640,7 @@ func (h *PlaybackHandler) ensureTranscodeSession(ctx context.Context, playSessio
 	if err := os.MkdirAll(h.TranscodeDir, 0o755); err != nil {
 		return nil, fmt.Errorf("prepare transcode dir: %w", err)
 	}
+	sourceVideoCodec, sourceVideoProfile, sourceVideoBitDepth := playback.SourceVideoTranscodeFacts(file)
 
 	initialSeekSeconds := 0.0
 	startSegmentNumber := 0
@@ -1642,18 +1653,21 @@ func (h *PlaybackHandler) ensureTranscodeSession(ctx context.Context, playSessio
 	}
 
 	opts := playback.TranscodeOpts{
-		SessionID:          upstreamSessionID,
-		InputPath:          file.FilePath,
-		OutputDir:          filepath.Join(h.TranscodeDir, upstreamSessionID),
-		SeekSeconds:        initialSeekSeconds,
-		StartSegmentNumber: startSegmentNumber,
-		TargetCodecVideo:   "h264",
-		TargetCodecAudio:   "aac",
-		FFmpegPath:         h.FFmpegPath,
-		HWAccel:            h.HWAccel,
-		AudioTrackIndex:    compatAudioTrackIndexOrDefault(source),
-		TotalDuration:      float64(source.Version.Duration),
-		FastStart:          true,
+		SessionID:           upstreamSessionID,
+		InputPath:           file.FilePath,
+		SourceVideoCodec:    sourceVideoCodec,
+		SourceVideoProfile:  sourceVideoProfile,
+		SourceVideoBitDepth: sourceVideoBitDepth,
+		OutputDir:           filepath.Join(h.TranscodeDir, upstreamSessionID),
+		SeekSeconds:         initialSeekSeconds,
+		StartSegmentNumber:  startSegmentNumber,
+		TargetCodecVideo:    compatTargetVideoCodec,
+		TargetCodecAudio:    compatTargetAudioCodec,
+		FFmpegPath:          h.FFmpegPath,
+		HWAccel:             h.HWAccel,
+		AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
+		TotalDuration:       float64(source.Version.Duration),
+		FastStart:           true,
 	}
 	if source.TranscodeAudio {
 		opts.TargetCodecVideo = "copy"

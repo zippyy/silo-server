@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 func init() {
@@ -30,12 +32,17 @@ func init() {
 type TranscodeOpts struct {
 	InputPath string
 	OutputDir string // e.g., /tmp/silo-transcode/{session_id}/
+	// subtitleFilterInputPath is a parser-safe local alias used only by the
+	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
+	subtitleFilterInputPath string
 	// OutputSubdir is the signed, root-relative reconstruction directory. Empty
 	// retains the legacy flat {session_id} layout.
 	OutputSubdir         string
 	TranscodeTransportID string
 	SessionID            string
 	SourceVideoCodec     string
+	SourceVideoProfile   string
+	SourceVideoBitDepth  int
 	VideoBitstreamFilter string // validated copy-mode BSF, e.g. dovi_rpu=strip=1
 	SeekSeconds          float64
 	// StreamOriginSeconds is the keyframe timestamp at which a copy-video
@@ -54,29 +61,49 @@ type TranscodeOpts struct {
 	FFmpegPath             string // optional explicit ffmpeg binary path
 	HWAccel                string // auto, qsv, vaapi, nvenc, none
 	HWDevice               string // e.g., /dev/dri/renderD128 (default if empty)
-	SubtitleTrackIndex     int    // -1 = no subtitles
-	SubtitleBurnIn         bool
+	// AvoidHWDevice asks the initial multi-device allocator to prefer any other
+	// present render device. It is a process-local startup hint used after an
+	// early GPU failure; the selected concrete device remains fully reserved and
+	// is the value frozen into the session recipe.
+	AvoidHWDevice string
+	// SoftwareVideoDecode keeps a hardware encoder while decoding the source
+	// on the CPU. Intel's VAAPI/QSV decoders cannot accept 10-bit AVC, but the
+	// decoded frames can still be converted to NV12, uploaded, and encoded by
+	// QSV/VAAPI. The flag is frozen into recipe cards so restarts do not put the
+	// unsupported hardware decoder back.
+	SoftwareVideoDecode bool
+	SubtitleTrackIndex  int // -1 = no subtitles
+	SubtitleBurnIn      bool
 	// SubtitleCodec is the probed codec of the burn-in track (e.g. "subrip",
 	// "hdmv_pgs_subtitle"). Bitmap codecs (PGS/DVD/DVB) select the overlay
 	// filter_complex pipeline; text codecs use the libass subtitles filter.
 	// Empty preserves the legacy text path for callers minted before the field.
 	SubtitleCodec   string
 	AudioTrackIndex int // -1 = default (first track), >= 0 = specific track
-	// TargetAudioChannels caps the re-encoded channel count. 0 (or anything
-	// below 3) keeps the historical stereo downmix; 6 preserves 5.1 from a
-	// surround source. Ignored for copy/passthrough audio targets.
+	// TargetAudioChannels selects mono (1), stereo (2/default), or 5.1 (6+)
+	// output. Ignored for copy/passthrough audio targets.
 	TargetAudioChannels int
-	TargetBitrateKbps   int     // max video bitrate in kbps; 0 = CRF-only (no cap)
-	TotalDuration       float64 // total media duration in seconds (for VOD manifest)
-	FastStart           bool    // use superfast preset for faster first-segment production
-	NodeType            string
-	ExecutionMode       string
-	FFmpegLogSink       FFmpegLogSink
+	// TargetAudioBitrateKbps caps an encoded audio stream. Zero selects the
+	// layout-appropriate AAC default. Ignored for copy/passthrough targets.
+	TargetAudioBitrateKbps int
+	TargetBitrateKbps      int     // max video bitrate in kbps; 0 = CRF-only (no cap)
+	TotalDuration          float64 // total media duration in seconds (for VOD manifest)
+	FastStart              bool    // use superfast preset for faster first-segment production
+	NodeType               string
+	ExecutionMode          string
+	FFmpegLogSink          FFmpegLogSink
 }
 
 // DV7ToHDR10BitstreamFilter strips Dolby Vision RPU metadata during a
 // copy-mode HLS remux; the enhancement layer is dropped by stream mapping.
 const DV7ToHDR10BitstreamFilter = "dovi_rpu=strip=1"
+
+const (
+	transcodeCodecH264 = "h264"
+	transcodeHWQSV     = "qsv"
+	transcodeHWVAAPI   = "vaapi"
+	transcodeHWNVENC   = "nvenc"
+)
 
 // TranscodeSession manages a running ffmpeg HLS transcode process.
 type TranscodeSession struct {
@@ -157,9 +184,20 @@ const DefaultSegmentDuration = defaultSegmentDuration
 // real sliding playlist instead of allocating a complete synthetic manifest.
 const maxSyntheticManifestSegments = 50_000
 
+// remountStartOffsetSeconds is a positive, effectively-zero HLS start offset.
+// Media3 suppresses live-edge position projection for EVENT playlists only
+// when EXT-X-START is positive. Anchoring one millisecond after the generation
+// origin keeps an initial start indistinguishable from zero while giving a
+// rebuilt MediaSource a stable timeline on which to restore its playhead.
+const remountStartOffsetSeconds = 0.001
+
 const maxPersistedFFmpegLines = 2000
 const maxPersistedFFmpegBytes = 256 * 1024
 const maxPersistedFFmpegChars = 2000
+
+// ManifestStartupTimeout is the maximum wait for FFmpeg's first safe playback
+// window before the caller reports a retryable startup timeout.
+const ManifestStartupTimeout = 30 * time.Second
 
 const (
 	maxSequentialMissingSegments = 2
@@ -179,18 +217,24 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	if opts.SegmentDuration <= 0 {
 		opts.SegmentDuration = defaultSegmentDuration
 	}
+	opts = resolveSoftwareVideoDecode(opts)
 	opts.HWAccel = resolveEffectiveTranscodeHWAccel(opts)
 	configuredHWDevices := ParseHWDeviceSet(opts.HWDevice)
 	reserveHWDeviceOnRestart := configuredHWDevices.Multi() && hwAccelBalancesRenderDevices(opts.HWAccel)
 	// Resolve a multi-device hw_device list to one concrete GPU. Restarts reuse
 	// the selected device, but each ffmpeg process owns its own reservation.
-	hwDevice, releaseHWDevice := AcquireHWDevice(opts.HWDevice, opts.HWAccel)
+	hwDevice, releaseHWDevice := acquireHWDevice(opts.HWDevice, opts.HWAccel, opts.AvoidHWDevice)
 	opts.HWDevice = hwDevice
+	opts.AvoidHWDevice = ""
 
 	// Ensure output directory exists.
 	if err := os.MkdirAll(opts.OutputDir, 0o755); err != nil {
 		releaseHWDevice()
 		return nil, fmt.Errorf("create output dir: %w", err)
+	}
+	if err := prepareSubtitleFilterInput(&opts); err != nil {
+		releaseHWDevice()
+		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -292,8 +336,45 @@ func IsMPEG4Part2VideoCodec(codec string) bool {
 	}
 }
 
+// RequiresSoftwareVideoDecode reports sources that the installed hardware
+// execution recipes must not feed to their video decoders. AVC High 10 is not
+// supported by Intel VAAPI/QSV decode; scanner rows are not perfectly uniform,
+// so either the probed bit depth or the normalized profile is sufficient.
+func RequiresSoftwareVideoDecode(codec, profile string, bitDepth int) bool {
+	if normalizeCodecV3(codec) != transcodeCodecH264 {
+		return false
+	}
+	normalizedProfile := strings.NewReplacer(" ", "", "-", "", "_", "").Replace(strings.ToLower(strings.TrimSpace(profile)))
+	return bitDepth > 8 || normalizedProfile == "high10" || normalizedProfile == "high10intra" || normalizedProfile == "hi10p"
+}
+
+// SourceVideoTranscodeFacts returns the primary source facts needed to choose
+// a safe FFmpeg decoder. Track metadata fills gaps in legacy media-file rows.
+func SourceVideoTranscodeFacts(file *models.MediaFile) (codec, profile string, bitDepth int) {
+	if file == nil {
+		return "", "", 0
+	}
+	codec = file.CodecVideo
+	if len(file.VideoTracks) == 0 {
+		return codec, "", 0
+	}
+	track := file.VideoTracks[0]
+	if strings.TrimSpace(codec) == "" {
+		codec = track.Codec
+	}
+	return codec, track.Profile, models.NormalizeVideoBitDepth(track.BitDepth, track.PixelFormat, track.Profile)
+}
+
+func resolveSoftwareVideoDecode(opts TranscodeOpts) TranscodeOpts {
+	if RequiresSoftwareVideoDecode(opts.SourceVideoCodec, opts.SourceVideoProfile, opts.SourceVideoBitDepth) {
+		opts.SoftwareVideoDecode = true
+	}
+	return opts
+}
+
 // buildFFmpegArgs constructs the full ffmpeg argument list from TranscodeOpts.
 func buildFFmpegArgs(opts TranscodeOpts) []string {
+	opts = resolveSoftwareVideoDecode(opts)
 	// Resolve "auto" into a concrete accel method once so all downstream
 	// helpers (appendHWAccelArgs, appendVideoArgs, etc.) see the real value.
 	opts.HWAccel = resolveEffectiveTranscodeHWAccel(opts)
@@ -425,6 +506,13 @@ func resolveEffectiveTranscodeHWAccel(opts TranscodeOpts) string {
 	if IsMPEG4Part2VideoCodec(opts.SourceVideoCodec) {
 		return "none"
 	}
+	// The bundled CUDA software-decode upload path has not been validated.
+	// Prefer the established libx264 fallback over selecting a decoder known
+	// not to accept this source. Intel QSV/VAAPI have the explicit upload paths
+	// below and retain hardware encoding.
+	if opts.SoftwareVideoDecode && hwAccel == transcodeHWNVENC {
+		return "none"
+	}
 	return hwAccel
 }
 
@@ -508,12 +596,20 @@ func appendSegmentBoundaryArgs(args []string, opts TranscodeOpts) []string {
 
 	// Hardware encoders (QSV, VAAPI, NVENC) may not reliably honor
 	// force_key_frames expressions. Set explicit GOP size so segment
-	// boundaries always start with an IDR frame. We assume 30 fps as a
+	// boundaries always start with an intra frame. We assume 30 fps as a
 	// safe ceiling — the GOP will be at most segmentDuration * 30 frames.
 	// Matches Jellyfin's approach for hardware encoders.
-	if opts.HWAccel == "qsv" || opts.HWAccel == "vaapi" || opts.HWAccel == "nvenc" {
+	if opts.HWAccel == transcodeHWQSV || opts.HWAccel == transcodeHWVAAPI || opts.HWAccel == transcodeHWNVENC {
 		gopSize := fmt.Sprintf("%d", opts.SegmentDuration*30)
 		args = append(args, "-g", gopSize, "-keyint_min", gopSize)
+	}
+	// QSV otherwise encodes force_key_frames requests as non-IDR intra frames.
+	// The HLS muxer cannot split independent segments on those frames, so a
+	// 23.976 fps source with a 60-frame GOP produces 2.5-5 second fragments and
+	// breaks the fixed-duration VOD manifest/restart timeline. Promote requested
+	// keyframes to IDRs so the muxer cuts at the requested boundaries.
+	if opts.HWAccel == transcodeHWQSV {
+		args = append(args, "-forced_idr", "1")
 	}
 
 	return args
@@ -534,10 +630,11 @@ func appendHWAccelArgs(args []string, opts TranscodeOpts) []string {
 			"-init_hw_device", fmt.Sprintf("vaapi=va:%s,driver=iHD,kernel_driver=i915,vendor_id=0x8086", hwDevice),
 			"-init_hw_device", "qsv=qs@va",
 			"-filter_hw_device", "va",
-			"-hwaccel", "vaapi",
-			"-hwaccel_output_format", "vaapi",
-			"-noautorotate",
 		)
+		if !opts.SoftwareVideoDecode {
+			args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
+		}
+		args = append(args, "-noautorotate")
 	case "vaapi":
 		vaapiDevice := PickRenderDevice(opts.HWDevice)
 		if vaapiDevice == "" {
@@ -546,10 +643,11 @@ func appendHWAccelArgs(args []string, opts TranscodeOpts) []string {
 		args = append(args,
 			"-init_hw_device", fmt.Sprintf("vaapi=hw:%s", vaapiDevice),
 			"-filter_hw_device", "hw",
-			"-hwaccel", "vaapi",
-			"-hwaccel_output_format", "vaapi",
 		)
-	case "nvenc":
+		if !opts.SoftwareVideoDecode {
+			args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
+		}
+	case transcodeHWNVENC:
 		args = append(args,
 			"-hwaccel", "cuda",
 			"-hwaccel_output_format", "cuda",
@@ -579,7 +677,7 @@ func videoPreset(opts TranscodeOpts, hwAccel string) string {
 func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 	codec := opts.TargetCodecVideo
 	if codec == "" {
-		codec = "h264"
+		codec = transcodeCodecH264
 	}
 
 	if codec == "copy" {
@@ -590,7 +688,7 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 	hasBitrateCap := opts.TargetBitrateKbps > 0
 
 	switch {
-	case opts.HWAccel == "qsv" && codec == "h264":
+	case opts.HWAccel == "qsv" && codec == transcodeCodecH264:
 		if hasBitrateCap {
 			// VBR mode with bitrate cap instead of global_quality.
 			args = append(args, "-c:v", "h264_qsv", "-preset", preset,
@@ -609,7 +707,7 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 		} else {
 			args = append(args, "-c:v", "hevc_qsv", "-preset", preset, "-global_quality", "28")
 		}
-	case opts.HWAccel == "vaapi" && codec == "h264":
+	case opts.HWAccel == "vaapi" && codec == transcodeCodecH264:
 		args = append(args, "-c:v", "h264_vaapi", "-qp", "23")
 		if hasBitrateCap {
 			args = append(args,
@@ -623,7 +721,7 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 				"-maxrate", fmt.Sprintf("%dk", opts.TargetBitrateKbps),
 				"-bufsize", fmt.Sprintf("%dk", opts.TargetBitrateKbps*2))
 		}
-	case opts.HWAccel == "nvenc" && codec == "h264":
+	case opts.HWAccel == transcodeHWNVENC && codec == transcodeCodecH264:
 		args = append(args, "-c:v", "h264_nvenc", "-rc:v", "vbr")
 		if hasBitrateCap {
 			args = append(args,
@@ -633,7 +731,7 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 		} else {
 			args = append(args, "-cq:v", "23", "-b:v", "0")
 		}
-	case opts.HWAccel == "nvenc" && codec == "hevc":
+	case opts.HWAccel == transcodeHWNVENC && codec == "hevc":
 		args = append(args, "-c:v", "hevc_nvenc", "-rc:v", "vbr")
 		if hasBitrateCap {
 			args = append(args,
@@ -675,11 +773,15 @@ func appendVideoFilterArgs(args []string, opts TranscodeOpts) []string {
 		return appendBitmapSubtitleBurnInArgs(args, opts)
 	case opts.SubtitleBurnIn && opts.SubtitleTrackIndex >= 0:
 		return appendSubtitleBurnInArgs(args, opts)
+	case opts.HWAccel == "qsv" && opts.SoftwareVideoDecode:
+		return append(args, "-vf", qsvSoftwareDecodeFilter(opts.TargetResolution))
+	case opts.HWAccel == "vaapi" && opts.SoftwareVideoDecode:
+		return append(args, "-vf", vaapiSoftwareDecodeFilter(opts.TargetResolution))
 	case opts.HWAccel == "qsv":
 		return append(args, "-vf", qsvScaleFilter(opts.TargetResolution))
 	case opts.HWAccel == "vaapi":
 		return append(args, "-vf", vaapiScaleFilter(opts.TargetResolution))
-	case opts.HWAccel == "nvenc":
+	case opts.HWAccel == transcodeHWNVENC:
 		return append(args, "-vf", nvencScaleFilter(opts.TargetResolution))
 	case opts.TargetResolution != "":
 		if scale := resolutionToScale(opts.TargetResolution); scale != "" {
@@ -725,17 +827,31 @@ func appendAudioArgs(args []string, opts TranscodeOpts) []string {
 		// Legacy Dolby Digital; universal AVR support.
 		args = append(args, "-c:a", "ac3", "-b:a", "448k")
 	default:
-		// Preserve surround from multichannel sources when the planner asked
-		// for it (AAC 5.1 decodes universally in Media3); the historical
-		// default stays a stereo 192k downmix.
-		if opts.TargetAudioChannels >= 6 {
-			args = append(args, "-c:a", "aac", "-b:a", "384k", "-ac", "6")
-		} else {
-			args = append(args, "-c:a", "aac", "-b:a", "192k", "-ac", "2")
-		}
+		channels, bitrateKbps := resolvedAACOutputV3(opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
+		args = append(args, "-c:a", "aac", "-b:a", strconv.Itoa(bitrateKbps)+"k", "-ac", strconv.Itoa(channels))
 	}
 
 	return args
+}
+
+func resolvedAACOutputV3(targetChannels, targetBitrateKbps int) (int, int) {
+	channels := 2
+	if targetChannels == 1 {
+		channels = 1
+	} else if targetChannels >= 6 {
+		channels = 6
+	}
+	if targetBitrateKbps > 0 {
+		return channels, targetBitrateKbps
+	}
+	switch channels {
+	case 1:
+		return channels, 128
+	case 6:
+		return channels, 384
+	default:
+		return channels, 192
+	}
 }
 
 // appendBitmapSubtitleBurnInArgs adds burn-in arguments for BITMAP subtitle
@@ -768,12 +884,20 @@ func appendBitmapSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string 
 	var graph string
 	switch opts.HWAccel {
 	case "qsv":
+		if opts.SoftwareVideoDecode {
+			graph = softwareDecodedBitmapBurnInGraph(opts, subInput, true)
+			break
+		}
 		// GPU composite: upload only the subtitle bitmap, overlay it onto the
 		// VAAPI video surface, scale, then map to QSV for the encoder. The scale
 		// helper already appends the hwmap=derive_device=qsv tail.
 		graph = subInput + "format=bgra,hwupload[sub];" +
 			"[0:v:0][sub]overlay_vaapi=eof_action=pass," + qsvScaleFilter(opts.TargetResolution) + "[vout]"
 	case "vaapi":
+		if opts.SoftwareVideoDecode {
+			graph = softwareDecodedBitmapBurnInGraph(opts, subInput, false)
+			break
+		}
 		// GPU composite: same as QSV but the frames stay on VAAPI through the
 		// encoder, so no cross-device map is needed.
 		graph = subInput + "format=bgra,hwupload[sub];" +
@@ -786,7 +910,7 @@ func appendBitmapSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string 
 		if scale := resolutionToScale(opts.TargetResolution); scale != "" {
 			cpuFilters += "," + scale
 		}
-		if opts.HWAccel == "nvenc" {
+		if opts.HWAccel == transcodeHWNVENC {
 			// Download to CPU for the overlay, then re-upload to CUDA.
 			graph = "[0:v:0]hwdownload,format=yuv420p[vmain];[vmain]" + cpuFilters +
 				",format=nv12,hwupload_cuda[vout]"
@@ -799,6 +923,21 @@ func appendBitmapSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string 
 	return append(args, "-filter_complex", graph)
 }
 
+// softwareDecodedBitmapBurnInGraph composites decoded CPU frames and uploads
+// the finished NV12 frames for the hardware encoder. It is the Hi10 AVC
+// counterpart of the all-hardware overlay_vaapi graph above.
+func softwareDecodedBitmapBurnInGraph(opts TranscodeOpts, subInput string, qsv bool) string {
+	filters := subInput + "overlay=eof_action=pass"
+	if scale := resolutionToScale(opts.TargetResolution); scale != "" {
+		filters += "," + scale
+	}
+	filters += ",format=nv12,hwupload"
+	if qsv {
+		filters += ",hwmap=derive_device=qsv,format=qsv"
+	}
+	return "[0:v:0]format=yuv420p[vmain];[vmain]" + filters + "[vout]"
+}
+
 // appendSubtitleBurnInArgs adds subtitle burn-in filter arguments for TEXT
 // subtitle codecs (SRT/ASS/…) via the libass-based subtitles= filter; bitmap
 // codecs take the overlay path in appendBitmapSubtitleBurnInArgs.
@@ -807,8 +946,12 @@ func appendBitmapSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string 
 // then re-uploaded: hwdownload → format=yuv420p → [scale,] subtitles → hwupload → hwmap.
 func appendSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string {
 	scale := resolutionToScale(opts.TargetResolution)
+	subtitleInputPath := opts.InputPath
+	if opts.subtitleFilterInputPath != "" {
+		subtitleInputPath = opts.subtitleFilterInputPath
+	}
 	subFilter := fmt.Sprintf("subtitles='%s':si=%d",
-		escapeFilterPath(opts.InputPath), opts.SubtitleTrackIndex)
+		escapeFilterPath(subtitleInputPath), opts.SubtitleTrackIndex)
 
 	// Build the CPU filter portion: scale (if any) then subtitle overlay.
 	// Scale must come before subtitles so text is rendered at target resolution.
@@ -821,16 +964,24 @@ func appendSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string {
 
 	switch opts.HWAccel {
 	case "qsv":
+		if opts.SoftwareVideoDecode {
+			vf := "format=yuv420p," + cpuFilters + ",format=nv12,hwupload,hwmap=derive_device=qsv,format=qsv"
+			return append(args, "-vf", vf)
+		}
 		// VAAPI→QSV pipeline: download from VAAPI surface to CPU, apply subtitle
 		// and scale filters, convert to nv12 (required by hwupload for VAAPI
 		// surfaces), upload back to VAAPI, then map to QSV for the encoder.
 		vf := "hwdownload,format=yuv420p," + cpuFilters + ",format=nv12,hwupload,hwmap=derive_device=qsv,format=qsv"
 		args = append(args, "-vf", vf)
 	case "vaapi":
+		if opts.SoftwareVideoDecode {
+			vf := "format=yuv420p," + cpuFilters + ",format=nv12,hwupload"
+			return append(args, "-vf", vf)
+		}
 		// VAAPI-only: download, apply CPU filters, convert to nv12, upload back.
 		vf := "hwdownload,format=yuv420p," + cpuFilters + ",format=nv12,hwupload"
 		args = append(args, "-vf", vf)
-	case "nvenc":
+	case transcodeHWNVENC:
 		// NVENC/CUDA: download to CPU for subtitle rendering, then upload back.
 		vf := "hwdownload,format=yuv420p," + cpuFilters + ",format=nv12,hwupload_cuda"
 		args = append(args, "-vf", vf)
@@ -882,6 +1033,18 @@ func qsvScaleFilter(res string) string {
 	}
 }
 
+func qsvSoftwareDecodeFilter(res string) string {
+	cpuFilters := ""
+	if scale := resolutionToScale(res); scale != "" {
+		cpuFilters = scale + ","
+	}
+	// High 10 AVC is decoded on the CPU. Scale those software frames before
+	// upload, matching the proven text-subtitle path; uploading first and then
+	// invoking scale_vaapi can leave the VAAPI/QSV graph alive without ever
+	// producing its initial HLS window.
+	return cpuFilters + "format=nv12,hwupload,hwmap=derive_device=qsv,format=qsv"
+}
+
 // vaapiScaleFilter keeps VAAPI frames in hardware and converts them to a
 // browser-compatible encoder format. Using the CPU scale filter on VAAPI frames
 // causes FFmpeg auto_scale format-negotiation failures.
@@ -902,6 +1065,14 @@ func vaapiScaleFilter(res string) string {
 	default:
 		return "scale_vaapi=format=nv12"
 	}
+}
+
+func vaapiSoftwareDecodeFilter(res string) string {
+	cpuFilters := ""
+	if scale := resolutionToScale(res); scale != "" {
+		cpuFilters = scale + ","
+	}
+	return cpuFilters + "format=nv12,hwupload"
 }
 
 func nvencScaleFilter(res string) string {
@@ -935,6 +1106,37 @@ var filterPathReplacer = strings.NewReplacer(
 // escapeFilterPath escapes special characters in file paths for ffmpeg filter syntax.
 func escapeFilterPath(path string) string {
 	return filterPathReplacer.Replace(path)
+}
+
+const subtitleFilterAliasName = "subtitle-source.media"
+
+// prepareSubtitleFilterInput avoids passing the library filename through
+// FFmpeg's nested filter parsers. In particular, an apostrophe can be consumed
+// by the filtergraph parser even after it was escaped for the subtitles filter.
+// A stable alias in the session directory keeps the media input unchanged and
+// is retained for seek restarts with the rest of TranscodeOpts.
+func prepareSubtitleFilterInput(opts *TranscodeOpts) error {
+	if !opts.SubtitleBurnIn || opts.SubtitleTrackIndex < 0 || NeedsBurnIn(opts.SubtitleCodec) {
+		return nil
+	}
+
+	aliasPath := filepath.Join(opts.OutputDir, subtitleFilterAliasName)
+	target, err := os.Readlink(aliasPath)
+	switch {
+	case err == nil:
+		if target != opts.InputPath {
+			return fmt.Errorf("prepare subtitle filter input: alias targets unexpected source")
+		}
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.Symlink(opts.InputPath, aliasPath); err != nil {
+			return fmt.Errorf("prepare subtitle filter input: %w", err)
+		}
+	default:
+		return fmt.Errorf("prepare subtitle filter input: inspect alias: %w", err)
+	}
+
+	opts.subtitleFilterInputPath = aliasPath
+	return nil
 }
 
 // minManifestSegments is the standard startup lead for actively encoded HLS.
@@ -1039,14 +1241,70 @@ func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]
 		!CanGenerateSyntheticManifest(opts.TotalDuration, opts.SegmentDuration) {
 		// Copy-video, unknown-duration, or oversized sessions must use FFmpeg's
 		// real manifest.
-		manifest, err := s.WaitForManifest(30 * time.Second)
+		manifest, err := s.WaitForManifest(ManifestStartupTimeout)
 		if err != nil {
 			return nil, err
 		}
+		manifest = stabilizeCopyHLSRemountTimeline(manifest, opts)
 		return RewriteManifestPaths(manifest, segPrefix, rawQuery)
 	}
 
 	return s.GenerateFullManifest(segPrefix, rawQuery), nil
+}
+
+// stabilizeCopyHLSRemountTimeline marks a bounded copy-HLS playlist as an
+// append-only EVENT and gives it a precise start at the generation origin.
+//
+// FFmpeg's real playlist has no end tag while it is growing, so players treat
+// it as live. Media3 consequently chooses the production edge whenever a track
+// change rebuilds its MediaSource, even though protocol v3 deliberately reused
+// the same A/V generation and the requested historical position is still in
+// the playlist. EVENT plus a positive EXT-X-START disables that projection and
+// leaves the client free to restore the source position on the stable timeline.
+//
+// The EVENT promise is made only when the known complete media fits within the
+// same 50,000-segment bound passed to FFmpeg. Such a playlist never evicts an
+// entry, and segment files are retained because delete_segments is not enabled.
+// Unknown or oversized real playlists remain ordinary sliding live playlists.
+func stabilizeCopyHLSRemountTimeline(manifest []byte, opts TranscodeOpts) []byte {
+	if !strings.EqualFold(opts.TargetCodecVideo, "copy") ||
+		opts.TotalDuration <= 0 ||
+		!CanGenerateSyntheticManifest(opts.TotalDuration, opts.SegmentDuration) ||
+		validateManifestHeader(manifest) != nil {
+		return manifest
+	}
+
+	lines := bytes.Split(manifest, []byte("\n"))
+	hasPlaylistType := false
+	hasStart := false
+	insertAfter := 0
+	for i, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("#EXT-X-PLAYLIST-TYPE:")):
+			hasPlaylistType = true
+		case bytes.HasPrefix(trimmed, []byte("#EXT-X-START:")):
+			hasStart = true
+		case bytes.HasPrefix(trimmed, []byte("#EXT-X-VERSION:")):
+			insertAfter = i + 1
+		}
+	}
+	if hasPlaylistType && hasStart {
+		return manifest
+	}
+
+	tags := make([][]byte, 0, 2)
+	if !hasPlaylistType {
+		tags = append(tags, []byte("#EXT-X-PLAYLIST-TYPE:EVENT"))
+	}
+	if !hasStart {
+		tags = append(tags, []byte(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES", remountStartOffsetSeconds)))
+	}
+	result := make([][]byte, 0, len(lines)+len(tags))
+	result = append(result, lines[:insertAfter]...)
+	result = append(result, tags...)
+	result = append(result, lines[insertAfter:]...)
+	return bytes.Join(result, []byte("\n"))
 }
 
 // SourceTimelineQueryParam opts a real transcode manifest into source-time

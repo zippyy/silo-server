@@ -30,6 +30,9 @@ type TranscodeStartRequest struct {
 	SessionID              string  `json:"session_id"`
 	InputPath              string  `json:"input_path"`
 	SourceVideoCodec       string  `json:"source_video_codec"`
+	SourceVideoProfile     string  `json:"source_video_profile,omitempty"`
+	SourceVideoBitDepth    int     `json:"source_video_bit_depth,omitempty"`
+	SoftwareVideoDecode    bool    `json:"software_video_decode,omitempty"`
 	VideoBitstreamFilter   string  `json:"video_bitstream_filter,omitempty"`
 	SeekSeconds            float64 `json:"seek_seconds"`
 	StreamOriginSeconds    float64 `json:"stream_origin_seconds,omitempty"`
@@ -39,6 +42,7 @@ type TranscodeStartRequest struct {
 	TargetCodecVideo       string  `json:"target_codec_video"`
 	TargetCodecAudio       string  `json:"target_codec_audio"`
 	TargetAudioChannels    int     `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps int     `json:"target_audio_bitrate_kbps,omitempty"`
 	TargetBitrateKbps      int     `json:"target_bitrate_kbps"`
 	SegmentDuration        int     `json:"segment_duration"`
 	HWAccel                string  `json:"hw_accel"`
@@ -421,12 +425,13 @@ func (s *Server) handleChapterThumbnailExtract(w http.ResponseWriter, r *http.Re
 
 	cfg := s.watcher.Config()
 	frame, reason, err := chapterthumbs.ExtractFrame(r.Context(), chapterthumbs.FrameExtractOptions{
-		InputPath:   req.InputPath,
-		SeekSeconds: req.SeekSeconds,
-		FFmpegPath:  cfg.Playback.FFmpegPath,
-		HWAccel:     cfg.Playback.HWAccel,
-		HWDevice:    cfg.Playback.HWDevice,
-		ToneMap:     req.ToneMap,
+		InputPath:            req.InputPath,
+		SeekSeconds:          req.SeekSeconds,
+		FFmpegPath:           cfg.Playback.FFmpegPath,
+		HWAccel:              cfg.Playback.HWAccel,
+		HWDevice:             cfg.Playback.HWDevice,
+		ToneMap:              req.ToneMap,
+		AllowSoftwareToneMap: req.AllowSoftwareToneMap,
 	})
 	if err != nil {
 		writeChapterThumbnailError(w, http.StatusUnprocessableEntity, reason, err.Error())
@@ -480,6 +485,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		OutputDir:              outputDir,
 		SessionID:              req.SessionID,
 		SourceVideoCodec:       req.SourceVideoCodec,
+		SourceVideoProfile:     req.SourceVideoProfile,
+		SourceVideoBitDepth:    req.SourceVideoBitDepth,
+		SoftwareVideoDecode:    req.SoftwareVideoDecode,
 		VideoBitstreamFilter:   req.VideoBitstreamFilter,
 		SeekSeconds:            req.SeekSeconds,
 		StreamOriginSeconds:    req.StreamOriginSeconds,
@@ -489,6 +497,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		TargetCodecVideo:       req.TargetCodecVideo,
 		TargetCodecAudio:       req.TargetCodecAudio,
 		TargetAudioChannels:    req.TargetAudioChannels,
+		TargetAudioBitrateKbps: req.TargetAudioBitrateKbps,
 		TargetBitrateKbps:      req.TargetBitrateKbps,
 		SegmentDuration:        req.SegmentDuration,
 		FFmpegPath:             cfg.Playback.FFmpegPath,
