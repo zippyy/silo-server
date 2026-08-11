@@ -21,6 +21,9 @@ type PluginAuthIdentity struct {
 	SnapshotPresent       bool
 	SnapshotPermissions   []string
 	SnapshotAccessGroupID *int64
+	// SnapshotAccessGroupPresent distinguishes a deliberately ungrouped
+	// snapshot from a group reference cleared by ON DELETE SET NULL.
+	SnapshotAccessGroupPresent bool
 }
 
 type pluginIdentityQueryRower interface {
@@ -60,7 +63,8 @@ func (r *PluginIdentityRepository) get(
 ) (*PluginAuthIdentity, error) {
 	query := `
 		SELECT id, user_id, managed_role_snapshot_present,
-		       managed_role_snapshot_permissions, managed_role_snapshot_access_group_id
+		       managed_role_snapshot_permissions, managed_role_snapshot_access_group_id,
+		       managed_role_snapshot_access_group_present
 		FROM plugin_auth_identities
 		WHERE plugin_installation_id = $1
 		  AND capability_id = $2
@@ -75,6 +79,7 @@ func (r *PluginIdentityRepository) get(
 		&identity.SnapshotPresent,
 		&identity.SnapshotPermissions,
 		&identity.SnapshotAccessGroupID,
+		&identity.SnapshotAccessGroupPresent,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -125,12 +130,14 @@ func (r *PluginIdentityRepository) SaveManagedRoleSnapshotTx(
 		SET managed_role_snapshot_present = true,
 		    managed_role_snapshot_permissions = $2,
 		    managed_role_snapshot_access_group_id = $3,
+		    managed_role_snapshot_access_group_present = $4,
 		    updated_at = NOW()
 		WHERE id = $1
 		  AND NOT managed_role_snapshot_present`,
 		identityID,
 		permissions,
 		accessGroupID,
+		accessGroupID != nil,
 	)
 	if err != nil {
 		return fmt.Errorf("save managed-role authorization snapshot: %w", err)
@@ -147,6 +154,7 @@ func (r *PluginIdentityRepository) ClearManagedRoleSnapshotTx(ctx context.Contex
 		SET managed_role_snapshot_present = false,
 		    managed_role_snapshot_permissions = NULL,
 		    managed_role_snapshot_access_group_id = NULL,
+		    managed_role_snapshot_access_group_present = false,
 		    updated_at = NOW()
 		WHERE id = $1`, identityID)
 	if err != nil {

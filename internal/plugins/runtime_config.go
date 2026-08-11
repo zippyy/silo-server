@@ -379,13 +379,40 @@ func (s *RuntimeConfigStore) GetAuthBinding(
 	installationID int,
 	capabilityID string,
 ) (*AuthBinding, error) {
+	return getAuthBinding(ctx, s.pool, installationID, capabilityID, false)
+}
+
+// GetAuthBindingTx loads and share-locks an auth binding so authorization
+// decisions made in the same transaction are ordered against concurrent
+// binding updates.
+func (s *RuntimeConfigStore) GetAuthBindingTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID int,
+	capabilityID string,
+) (*AuthBinding, error) {
+	return getAuthBinding(ctx, tx, installationID, capabilityID, true)
+}
+
+func getAuthBinding(
+	ctx context.Context,
+	db interface {
+		QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	},
+	installationID int,
+	capabilityID string,
+	forShare bool,
+) (*AuthBinding, error) {
 	var binding AuthBinding
-	err := s.pool.QueryRow(ctx, `
+	query := `
 		SELECT plugin_installation_id, capability_id, enabled, display_order, auto_provision,
 		       default_login, managed_roles_enabled, created_at, updated_at
 		FROM plugin_auth_bindings
-		WHERE plugin_installation_id = $1 AND capability_id = $2
-	`, installationID, capabilityID).Scan(
+		WHERE plugin_installation_id = $1 AND capability_id = $2`
+	if forShare {
+		query += " FOR SHARE"
+	}
+	err := db.QueryRow(ctx, query, installationID, capabilityID).Scan(
 		&binding.InstallationID,
 		&binding.CapabilityID,
 		&binding.Enabled,

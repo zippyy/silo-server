@@ -33,21 +33,51 @@ type pluginAuthClient interface {
 
 type pluginAuthClientFactory func(ctx context.Context) (pluginAuthClient, error)
 
+// ManagedRoleBindingStore resolves the current operator authorization inside
+// the role-transition transaction.
+type ManagedRoleBindingStore interface {
+	GetAuthBindingTx(ctx context.Context, tx pgx.Tx, installationID int, capabilityID string) (*plugins.AuthBinding, error)
+}
+
+// UserSessionRevoker invalidates compatibility sessions after a committed
+// managed-role demotion.
+type UserSessionRevoker func(ctx context.Context, userID int) error
+
+// PluginProviderOption supplies runtime-owned authorization dependencies.
+type PluginProviderOption func(*PluginProvider)
+
+// WithManagedRoleBindingStore makes persisted auth-binding policy authoritative
+// for every managed-role authentication.
+func WithManagedRoleBindingStore(store ManagedRoleBindingStore) PluginProviderOption {
+	return func(provider *PluginProvider) {
+		provider.managedRoleBindings = store
+	}
+}
+
+// WithUserSessionRevoker installs the post-commit compatibility-session hook.
+func WithUserSessionRevoker(revoker UserSessionRevoker) PluginProviderOption {
+	return func(provider *PluginProvider) {
+		provider.compatSessions = revoker
+	}
+}
+
 type PluginProviderConfig struct {
-	InstallationID      int
-	CapabilityID        string
-	DisplayName         string
-	AutoProvision       bool
-	ManagedRoleContract string
+	InstallationID                int
+	CapabilityID                  string
+	DisplayName                   string
+	AutoProvision                 bool
+	AdvertisedManagedRoleContract string
 }
 
 type PluginProvider struct {
-	config       PluginProviderConfig
-	client       pluginAuthClientFactory
-	sessions     *SessionRepository
-	users        *UserRepository
-	identities   *PluginIdentityRepository
-	accessGroups *access.GroupStore
+	config              PluginProviderConfig
+	client              pluginAuthClientFactory
+	sessions            *SessionRepository
+	users               *UserRepository
+	identities          *PluginIdentityRepository
+	accessGroups        *access.GroupStore
+	managedRoleBindings ManagedRoleBindingStore
+	compatSessions      UserSessionRevoker
 }
 
 func NewPluginProviderWithClientFactory(
@@ -56,8 +86,9 @@ func NewPluginProviderWithClientFactory(
 	users *UserRepository,
 	pool *pgxpool.Pool,
 	clientFactory pluginAuthClientFactory,
+	options ...PluginProviderOption,
 ) *PluginProvider {
-	return &PluginProvider{
+	provider := &PluginProvider{
 		config:       config,
 		client:       clientFactory,
 		sessions:     sessions,
@@ -65,6 +96,12 @@ func NewPluginProviderWithClientFactory(
 		identities:   NewPluginIdentityRepository(pool),
 		accessGroups: access.NewGroupStore(pool),
 	}
+	for _, option := range options {
+		if option != nil {
+			option(provider)
+		}
+	}
+	return provider
 }
 
 func NewPluginProvider(
@@ -75,10 +112,11 @@ func NewPluginProvider(
 	resolver interface {
 		AuthProviderClient(ctx context.Context, installationID int, capabilityID string) (*pluginhost.AuthProviderClient, error)
 	},
+	options ...PluginProviderOption,
 ) *PluginProvider {
 	return NewPluginProviderWithClientFactory(config, sessions, users, pool, func(ctx context.Context) (pluginAuthClient, error) {
 		return resolver.AuthProviderClient(ctx, config.InstallationID, config.CapabilityID)
-	})
+	}, options...)
 }
 
 func (p *PluginProvider) Authenticate(ctx context.Context, creds Credentials) (*models.User, error) {
@@ -189,10 +227,6 @@ func (p *PluginProvider) autoProvisionUser(
 	creds Credentials,
 	response *pluginv1.AuthenticateResponse,
 ) (*models.User, error) {
-	desiredRole, roleManaged, err := managedRoleFromResponse(response, p.config.ManagedRoleContract)
-	if err != nil {
-		return nil, err
-	}
 	usernameBase := provisionedUsernameBase(response, creds, p.config.InstallationID)
 	email := provisionedEmail(response, key)
 	password, err := randomPluginOnlyPassword()
@@ -206,6 +240,10 @@ func (p *PluginProvider) autoProvisionUser(
 		return nil, fmt.Errorf("begin plugin user provisioning: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	desiredRole, roleManaged, err := p.managedRoleFromResponseTx(ctx, tx, response)
+	if err != nil {
+		return nil, err
+	}
 
 	if existing, getErr := p.identities.GetTx(ctx, tx, key, false); getErr == nil {
 		if err := tx.Rollback(ctx); err != nil {
@@ -282,7 +320,7 @@ func (p *PluginProvider) autoProvisionUser(
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit plugin user provisioning: %w", err)
 	}
-	p.logRoleTransition(ctx, user.ID, transition)
+	p.handleCommittedRoleTransition(ctx, user.ID, transition)
 	return p.users.GetByID(ctx, user.ID)
 }
 
@@ -331,11 +369,11 @@ func (p *PluginProvider) synchronizeManagedRole(
 	user *models.User,
 	response *pluginv1.AuthenticateResponse,
 ) (*models.User, error) {
-	desiredRole, managed, err := managedRoleFromResponse(response, p.config.ManagedRoleContract)
+	requested, err := managedRoleRequested(response)
 	if err != nil {
 		return nil, err
 	}
-	if !managed {
+	if !requested {
 		return user, nil
 	}
 
@@ -344,6 +382,13 @@ func (p *PluginProvider) synchronizeManagedRole(
 		return nil, fmt.Errorf("begin managed-role synchronization: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	desiredRole, managed, err := p.managedRoleFromResponseTx(ctx, tx, response)
+	if err != nil {
+		return nil, err
+	}
+	if !managed {
+		return user, nil
+	}
 	identity, err := p.identities.GetTx(ctx, tx, key, true)
 	if err != nil {
 		return nil, err
@@ -365,8 +410,29 @@ func (p *PluginProvider) synchronizeManagedRole(
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit managed-role synchronization: %w", err)
 	}
-	p.logRoleTransition(ctx, updated.ID, transition)
+	p.handleCommittedRoleTransition(ctx, updated.ID, transition)
 	return updated, nil
+}
+
+func (p *PluginProvider) managedRoleFromResponseTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	response *pluginv1.AuthenticateResponse,
+) (string, bool, error) {
+	authorizedContract := ""
+	if p.config.AdvertisedManagedRoleContract == ManagedRoleContractV1 && p.managedRoleBindings != nil {
+		binding, err := p.managedRoleBindings.GetAuthBindingTx(
+			ctx, tx, p.config.InstallationID, p.config.CapabilityID,
+		)
+		if err != nil {
+			if !errors.Is(err, plugins.ErrAuthBindingNotFound) {
+				return "", false, fmt.Errorf("load managed-role authorization: %w", err)
+			}
+		} else if binding.Enabled && binding.ManagedRolesEnabled {
+			authorizedContract = p.config.AdvertisedManagedRoleContract
+		}
+	}
+	return managedRoleFromResponse(response, authorizedContract)
 }
 
 type roleTransition struct {
@@ -415,6 +481,12 @@ func (p *PluginProvider) applyManagedRoleTx(
 			if err != nil {
 				return nil, transition, err
 			}
+		} else if identity.SnapshotAccessGroupPresent && accessGroupID == nil {
+			var err error
+			accessGroupID, err = p.accessGroups.DefaultIDTx(ctx, tx)
+			if err != nil {
+				return nil, transition, err
+			}
 		}
 		role := managedRoleUser
 		if err := p.users.UpdateTx(ctx, tx, user.ID, models.UpdateUserInput{
@@ -445,6 +517,27 @@ func (p *PluginProvider) applyManagedRoleTx(
 	return updated, transition, nil
 }
 
+func (p *PluginProvider) handleCommittedRoleTransition(ctx context.Context, userID int, transition roleTransition) {
+	p.logRoleTransition(ctx, userID, transition)
+	if !transition.changed || transition.previous != managedRoleAdmin || transition.next != managedRoleUser {
+		return
+	}
+	if p.compatSessions == nil {
+		slog.WarnContext(ctx, "compatibility session revocation unavailable after managed-role demotion",
+			"component", "auth",
+			"user_id", userID,
+		)
+		return
+	}
+	if err := p.compatSessions(ctx, userID); err != nil {
+		slog.WarnContext(ctx, "compatibility session revocation failed after managed-role demotion",
+			"component", "auth",
+			"user_id", userID,
+			"error", err,
+		)
+	}
+}
+
 func (p *PluginProvider) logRoleTransition(ctx context.Context, userID int, transition roleTransition) {
 	if !transition.changed || transition.previous == transition.next {
 		return
@@ -456,7 +549,7 @@ func (p *PluginProvider) logRoleTransition(ctx context.Context, userID int, tran
 		"user_id", userID,
 		"previous_role", transition.previous,
 		"new_role", transition.next,
-		"contract", p.config.ManagedRoleContract,
+		"contract", p.config.AdvertisedManagedRoleContract,
 	)
 }
 

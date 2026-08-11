@@ -59,21 +59,11 @@ func managedRoleFromResponse(
 	response *pluginv1.AuthenticateResponse,
 	authorizedContract string,
 ) (string, bool, error) {
-	if response == nil || response.GetClaims() == nil {
-		return "", false, nil
+	managed, err := managedRoleRequested(response)
+	if err != nil || !managed {
+		return "", false, err
 	}
 	claims := response.GetClaims().AsMap()
-	rawMarker, hasMarker := claims[managedRoleMarkerClaimKey]
-	if !hasMarker {
-		return "", false, nil
-	}
-	managed, ok := rawMarker.(bool)
-	if !ok {
-		return "", false, fmt.Errorf("plugin auth claim %q must be a boolean", managedRoleMarkerClaimKey)
-	}
-	if !managed {
-		return "", false, nil
-	}
 	if authorizedContract != ManagedRoleContractV1 {
 		return "", false, fmt.Errorf("plugin is not authorized for managed roles")
 	}
@@ -86,6 +76,22 @@ func managedRoleFromResponse(
 		return "", false, fmt.Errorf("plugin managed-role response contains an unsupported role")
 	}
 	return role, true, nil
+}
+
+func managedRoleRequested(response *pluginv1.AuthenticateResponse) (bool, error) {
+	if response == nil || response.GetClaims() == nil {
+		return false, nil
+	}
+	claims := response.GetClaims().AsMap()
+	rawMarker, hasMarker := claims[managedRoleMarkerClaimKey]
+	if !hasMarker {
+		return false, nil
+	}
+	managed, ok := rawMarker.(bool)
+	if !ok {
+		return false, fmt.Errorf("plugin auth claim %q must be a boolean", managedRoleMarkerClaimKey)
+	}
+	return managed, nil
 }
 
 func strictStringSet(value any) (map[string]struct{}, bool) {

@@ -19,6 +19,10 @@ type sessionPersistence interface {
 	DeleteByToken(ctx context.Context, token string) error
 }
 
+type userSessionPersistence interface {
+	DeleteByUserID(ctx context.Context, userID int) (int, error)
+}
+
 // Session stores a compat login plus upstream Silo credentials.
 type Session struct {
 	Token                 string
@@ -160,8 +164,19 @@ func (s *SessionStore) Delete(token string) {
 	}
 }
 
-// DeleteByUserID removes all compat sessions for a given Silo user ID.
-func (s *SessionStore) DeleteByUserID(userID int) {
+// RevokeByUserID synchronously removes every persisted and in-memory compat
+// session for a Silo user. Persistence is cleared first so a storage failure
+// is reported instead of leaving a memory-only partial result.
+func (s *SessionStore) RevokeByUserID(ctx context.Context, userID int) error {
+	if s.repo != nil {
+		repo, ok := s.repo.(userSessionPersistence)
+		if !ok {
+			return errors.New("jellycompat session persistence does not support user revocation")
+		}
+		if _, err := repo.DeleteByUserID(ctx, userID); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	for token, session := range s.sessions {
 		if session.StreamAppUserID == userID {
@@ -169,12 +184,14 @@ func (s *SessionStore) DeleteByUserID(userID int) {
 		}
 	}
 	s.mu.Unlock()
-	if s.repo != nil {
-		if repo, ok := s.repo.(*SessionRepository); ok {
-			if _, err := repo.DeleteByUserID(context.Background(), userID); err != nil {
-				slog.Warn("jellycompat session store delete by user failed", "user_id", userID, "error", err)
-			}
-		}
+	return nil
+}
+
+// DeleteByUserID retains the existing best-effort API for administrative
+// callers that do not propagate cleanup failures.
+func (s *SessionStore) DeleteByUserID(userID int) {
+	if err := s.RevokeByUserID(context.Background(), userID); err != nil {
+		slog.Warn("jellycompat session store delete by user failed", "user_id", userID, "error", err)
 	}
 }
 

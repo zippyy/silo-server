@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -2294,6 +2295,33 @@ func main() {
 	}
 	_ = audiobooksService
 
+	// Compatibility sessions live outside auth_sessions. Keep one post-commit
+	// revoker for managed-role demotion and ordinary administrative revocation.
+	// compatServer is populated after the Jellyfin server is constructed; the
+	// closure reaches its live in-memory store when enabled and its persistent
+	// repository when disabled.
+	var compatServer *jellycompat.Server
+	revokeCompatibilitySessions := func(ctx context.Context, userID int) error {
+		var revokeErrors []error
+		if compatServer != nil {
+			if err := compatServer.SessionStore().RevokeByUserID(ctx, userID); err != nil {
+				revokeErrors = append(revokeErrors, fmt.Errorf("revoke Jellyfin compatibility sessions: %w", err))
+			}
+		} else if deps.DB != nil {
+			repo := jellycompat.NewSessionRepository(deps.DB, deps.SecretCipher)
+			if _, err := repo.DeleteByUserID(ctx, userID); err != nil {
+				revokeErrors = append(revokeErrors, fmt.Errorf("revoke persisted Jellyfin compatibility sessions: %w", err))
+			}
+		}
+		if deps.DB != nil {
+			store := &audiobooks.ABSSessionStore{Pool: deps.DB}
+			if err := store.RevokeTokensByUserID(ctx, userID); err != nil {
+				revokeErrors = append(revokeErrors, fmt.Errorf("revoke ABS compatibility sessions: %w", err))
+			}
+		}
+		return errors.Join(revokeErrors...)
+	}
+
 	if deps.DB != nil && pluginInstallationStore != nil && pluginRuntimeConfigStore != nil && deps.PluginService != nil {
 		userRepo := auth.NewUserRepository(deps.DB)
 		sessionRepo := auth.NewSessionRepository(deps.DB)
@@ -2320,10 +2348,7 @@ func main() {
 			if err == nil {
 				for _, capability := range capabilities {
 					if capability != nil && capability.Type == "auth_provider.v1" && capability.ID == binding.CapabilityID {
-						contract, contractErr := auth.ManagedRoleContractForBinding(
-							capability.Metadata,
-							binding.ManagedRolesEnabled,
-						)
+						contract, contractErr := auth.ManagedRoleContractFromMetadata(capability.Metadata)
 						if contractErr != nil {
 							slog.WarnContext(appCtx, "ignoring malformed managed-role advertisement",
 								"component", "auth",
@@ -2394,28 +2419,31 @@ func main() {
 				},
 				Provider: auth.NewPluginProvider(
 					auth.PluginProviderConfig{
-						InstallationID:      binding.InstallationID,
-						CapabilityID:        binding.CapabilityID,
-						DisplayName:         displayName,
-						AutoProvision:       binding.AutoProvision,
-						ManagedRoleContract: managedRoleContract,
+						InstallationID:                binding.InstallationID,
+						CapabilityID:                  binding.CapabilityID,
+						DisplayName:                   displayName,
+						AutoProvision:                 binding.AutoProvision,
+						AdvertisedManagedRoleContract: managedRoleContract,
 					},
 					sessionRepo,
 					userRepo,
 					deps.DB,
 					deps.PluginService,
+					auth.WithManagedRoleBindingStore(pluginRuntimeConfigStore),
+					auth.WithUserSessionRevoker(revokeCompatibilitySessions),
 				),
 			})
 		}
 	}
 
 	// Step 7: Build HTTP router with all dependencies.
-	// compatServer is populated after the compat server is constructed below;
-	// the closure captures the pointer so revocation calls reach the live instance.
-	var compatServer *jellycompat.Server
 	deps.OnUserSessionsRevoked = func(ctx context.Context, userID int) {
-		if compatServer != nil {
-			compatServer.SessionStore().DeleteByUserID(userID)
+		if err := revokeCompatibilitySessions(ctx, userID); err != nil {
+			slog.WarnContext(ctx, "compatibility session revocation failed after administrative authorization change",
+				"component", "auth",
+				"user_id", userID,
+				"error", err,
+			)
 		}
 	}
 

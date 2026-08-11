@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -13,8 +15,13 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/audiobooks"
+	"github.com/Silo-Server/silo-server/internal/audiobooks/abs"
 	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/jellycompat"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
@@ -33,17 +40,16 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	var hardened bool
 	if err := pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
+		SELECT COUNT(*) = 2
+			FROM information_schema.columns
 			WHERE table_schema = 'public'
 			  AND table_name = 'plugin_auth_identities'
-			  AND column_name = 'capability_id'
-		)`).Scan(&hardened); err != nil {
+			  AND column_name IN ('capability_id', 'managed_role_snapshot_access_group_present')`).Scan(&hardened); err != nil {
 		t.Fatal(err)
 	}
 	if !hardened {
 		if os.Getenv("SILO_REQUIRE_AUTH_DB_TESTS") == "1" {
-			t.Fatal("SILO_REQUIRE_AUTH_DB_TESTS=1 requires plugin auth hardening migrations")
+			t.Fatal("SILO_REQUIRE_AUTH_DB_TESTS=1 requires all plugin auth hardening migrations")
 		}
 		t.Skip("plugin auth identity hardening migration is not applied")
 	}
@@ -65,8 +71,10 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 		}
 	})
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, enabled, auto_provision)
-		VALUES ($1, 'ldap', true, true)`, installationID); err != nil {
+		INSERT INTO plugin_auth_bindings (
+			plugin_installation_id, capability_id, enabled, auto_provision, managed_roles_enabled
+		)
+		VALUES ($1, 'ldap', true, true, true)`, installationID); err != nil {
 		t.Fatal(err)
 	}
 	userRepo := auth.NewUserRepository(pool)
@@ -101,15 +109,16 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	sessions := auth.NewSessionRepository(pool)
 	provider := auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:      installationID,
-			CapabilityID:        "ldap",
-			AutoProvision:       true,
-			ManagedRoleContract: auth.ManagedRoleContractV1,
+			InstallationID:                installationID,
+			CapabilityID:                  "ldap",
+			AutoProvision:                 true,
+			AdvertisedManagedRoleContract: auth.ManagedRoleContractV1,
 		},
 		sessions,
 		userRepo,
 		pool,
 		nil,
+		auth.WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(pool)),
 	)
 	response := managedRoleResponse(t, key.ExternalSubject, "admin")
 	promoted, err := provider.CompleteOAuth(ctx, response)
@@ -149,11 +158,136 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 		t.Fatalf("admin token before demotion status=%d, want %d", status, http.StatusNoContent)
 	}
 
+	cipher, err := secret.New([]byte("managed-role-compat-session-test-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jellyStore := jellycompat.NewPersistentSessionStore(
+		time.Hour,
+		time.Now,
+		jellycompat.NewSessionRepository(pool, cipher),
+	)
+	jellyTokens := []string{uuid.NewString(), uuid.NewString()}
+	for _, jellyToken := range jellyTokens {
+		if err := jellyStore.Put(jellycompat.Session{
+			Token:                 jellyToken,
+			Username:              promoted.Username,
+			AccountUsername:       promoted.Username,
+			ProfileID:             uuid.NewString(),
+			ProfileName:           promoted.Username,
+			PseudoUserID:          uuid.New(),
+			StreamAppUserID:       promoted.ID,
+			StreamAppAccessToken:  "compat-access",
+			StreamAppRefreshToken: "compat-refresh",
+			StreamAppTokenExpiry:  time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	absStore := &audiobooks.ABSSessionStore{Pool: pool}
+	absTokens := []string{uuid.NewString(), uuid.NewString()}
+	for index, jti := range absTokens {
+		tokenType := "access"
+		if index == 1 {
+			tokenType = "refresh"
+		}
+		if err := absStore.InsertToken(ctx, abs.ABSToken{
+			UserID:    strconv.Itoa(promoted.ID),
+			ProfileID: uuid.NewString(),
+			JTI:       jti,
+			Type:      tokenType,
+			ExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, jellyToken := range jellyTokens {
+		if _, ok := jellyStore.Get(jellyToken); !ok {
+			t.Fatal("Jellyfin compatibility session did not resolve before demotion")
+		}
+	}
+	for _, jti := range absTokens {
+		token, err := absStore.GetTokenByJTI(ctx, jti)
+		if err != nil || token.RevokedAt != nil {
+			t.Fatalf("ABS token before demotion = %+v, %v", token, err)
+		}
+	}
+
+	revokeCompat := func(ctx context.Context, userID int) error {
+		var revokeErrors []error
+		if err := jellyStore.RevokeByUserID(ctx, userID); err != nil {
+			revokeErrors = append(revokeErrors, err)
+		}
+		if err := absStore.RevokeTokensByUserID(ctx, userID); err != nil {
+			revokeErrors = append(revokeErrors, err)
+		}
+		return errors.Join(revokeErrors...)
+	}
+	provider = auth.NewPluginProviderWithClientFactory(
+		auth.PluginProviderConfig{
+			InstallationID:                installationID,
+			CapabilityID:                  "ldap",
+			AutoProvision:                 true,
+			AdvertisedManagedRoleContract: auth.ManagedRoleContractV1,
+		},
+		sessions,
+		userRepo,
+		pool,
+		nil,
+		auth.WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(pool)),
+		auth.WithUserSessionRevoker(revokeCompat),
+	)
+	failingProvider := auth.NewPluginProviderWithClientFactory(
+		auth.PluginProviderConfig{
+			InstallationID:                installationID,
+			CapabilityID:                  "ldap",
+			AutoProvision:                 true,
+			AdvertisedManagedRoleContract: auth.ManagedRoleContractV1,
+		},
+		nil,
+		userRepo,
+		pool,
+		nil,
+		auth.WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(pool)),
+		auth.WithUserSessionRevoker(revokeCompat),
+	)
+	if _, err := failingProvider.CompleteOAuth(ctx, managedRoleResponse(t, key.ExternalSubject, "user")); err == nil {
+		t.Fatal("demotion without the transactional session repository unexpectedly succeeded")
+	}
+	if status := request(); status != http.StatusNoContent {
+		t.Fatalf("failed demotion revoked main session: status=%d", status)
+	}
+	for _, jellyToken := range jellyTokens {
+		if _, ok := jellyStore.Get(jellyToken); !ok {
+			t.Fatal("failed demotion revoked Jellyfin compatibility session")
+		}
+	}
+	for _, jti := range absTokens {
+		token, err := absStore.GetTokenByJTI(ctx, jti)
+		if err != nil || token.RevokedAt != nil {
+			t.Fatalf("failed demotion changed ABS token = %+v, %v", token, err)
+		}
+	}
+
 	if _, err := provider.CompleteOAuth(ctx, managedRoleResponse(t, key.ExternalSubject, "user")); err != nil {
 		t.Fatal(err)
 	}
 	if status := request(); status != http.StatusUnauthorized {
 		t.Fatalf("same admin token after demotion status=%d, want %d", status, http.StatusUnauthorized)
+	}
+	for _, jellyToken := range jellyTokens {
+		if _, ok := jellyStore.Get(jellyToken); ok {
+			t.Fatal("Jellyfin compatibility session survived successful demotion")
+		}
+	}
+	for _, jti := range absTokens {
+		token, err := absStore.GetTokenByJTI(ctx, jti)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if token.RevokedAt == nil {
+			t.Fatalf("ABS %s token survived successful demotion", token.Type)
+		}
 	}
 }
 

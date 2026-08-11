@@ -147,9 +147,9 @@ func TestManagedRoleTransitionAuditLog(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 	provider := &PluginProvider{config: PluginProviderConfig{
-		InstallationID:      42,
-		CapabilityID:        "ldap",
-		ManagedRoleContract: ManagedRoleContractV1,
+		InstallationID:                42,
+		CapabilityID:                  "ldap",
+		AdvertisedManagedRoleContract: ManagedRoleContractV1,
 	}}
 	provider.logRoleTransition(context.Background(), 73, roleTransition{
 		previous: managedRoleUser,

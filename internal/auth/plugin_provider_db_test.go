@@ -18,6 +18,7 @@ import (
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
 type pluginProviderDBFixture struct {
@@ -54,19 +55,18 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	}
 	var hardened bool
 	if err := pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
+		SELECT COUNT(*) = 2
+			FROM information_schema.columns
 			WHERE table_schema = 'public'
 			  AND table_name = 'plugin_auth_identities'
-			  AND column_name = 'capability_id'
-		)`).Scan(&hardened); err != nil {
+			  AND column_name IN ('capability_id', 'managed_role_snapshot_access_group_present')`).Scan(&hardened); err != nil {
 		pool.Close()
 		t.Fatalf("check plugin identity migration: %v", err)
 	}
 	if !hardened {
 		pool.Close()
 		if os.Getenv("SILO_REQUIRE_AUTH_DB_TESTS") == "1" {
-			t.Fatal("SILO_REQUIRE_AUTH_DB_TESTS=1 requires plugin auth hardening migrations")
+			t.Fatal("SILO_REQUIRE_AUTH_DB_TESTS=1 requires all plugin auth hardening migrations")
 		}
 		t.Skip("plugin auth identity hardening migration is not applied")
 	}
@@ -82,8 +82,8 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	capabilityID := "ldap"
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO plugin_auth_bindings (
-			plugin_installation_id, capability_id, enabled, auto_provision
-		) VALUES ($1, $2, true, true)`, installationID, capabilityID); err != nil {
+			plugin_installation_id, capability_id, enabled, auto_provision, managed_roles_enabled
+		) VALUES ($1, $2, true, true, true)`, installationID, capabilityID); err != nil {
 		pool.Close()
 		t.Fatalf("create plugin auth binding: %v", err)
 	}
@@ -117,16 +117,17 @@ func (f *pluginProviderDBFixture) provider(managed bool) *PluginProvider {
 	}
 	return NewPluginProviderWithClientFactory(
 		PluginProviderConfig{
-			InstallationID:      f.installationID,
-			CapabilityID:        f.capabilityID,
-			DisplayName:         "LDAP",
-			AutoProvision:       true,
-			ManagedRoleContract: contract,
+			InstallationID:                f.installationID,
+			CapabilityID:                  f.capabilityID,
+			DisplayName:                   "LDAP",
+			AutoProvision:                 true,
+			AdvertisedManagedRoleContract: contract,
 		},
 		NewSessionRepository(f.pool),
 		NewUserRepository(f.pool),
 		f.pool,
 		nil,
+		WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(f.pool)),
 	)
 }
 
@@ -193,6 +194,145 @@ func (f *pluginProviderDBFixture) createGroup(ctx context.Context, suffix string
 		f.t.Fatalf("create access group: %v", err)
 	}
 	return group.ID
+}
+
+func TestPluginManagedRoleAuthorizationFollowsBindingWithoutReconstructionDB(t *testing.T) {
+	f := newPluginProviderDBFixture(t)
+	ctx := context.Background()
+	user, key := f.createIdentityUser(ctx, managedRoleUser, nil, nil, "entryUUID:dynamic-role-binding")
+	provider := f.provider(true)
+	response := f.response(key.ExternalSubject, user.Username, user.Email, managedRoleAdmin)
+
+	store := plugins.NewRuntimeConfigStore(f.pool)
+	binding, err := store.GetAuthBinding(ctx, f.installationID, f.capabilityID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.ManagedRolesEnabled = false
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err == nil {
+		t.Fatal("disabled binding accepted authoritative administrator claims")
+	}
+	unchanged, err := NewUserRepository(f.pool).GetByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Role != managedRoleUser {
+		t.Fatalf("disabled binding changed role to %q", unchanged.Role)
+	}
+
+	binding.ManagedRolesEnabled = true
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	promoted, err := provider.CompleteOAuth(ctx, response)
+	if err != nil {
+		t.Fatalf("same provider did not observe enabled binding: %v", err)
+	}
+	if promoted.Role != managedRoleAdmin {
+		t.Fatalf("enabled binding role=%q, want admin", promoted.Role)
+	}
+
+	binding.ManagedRolesEnabled = false
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err == nil {
+		t.Fatal("same provider retained managed-role authority after binding was disabled")
+	}
+	stillPromoted, err := NewUserRepository(f.pool).GetByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillPromoted.Role != managedRoleAdmin {
+		t.Fatalf("unauthorized claim mutated existing role to %q", stillPromoted.Role)
+	}
+
+	binding.Enabled = false
+	binding.ManagedRolesEnabled = true
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err == nil {
+		t.Fatal("disabled binding retained managed-role authority")
+	}
+	if _, err := f.pool.Exec(ctx, `
+		DELETE FROM plugin_auth_bindings
+		WHERE plugin_installation_id = $1 AND capability_id = $2`, f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err == nil {
+		t.Fatal("deleted binding retained managed-role authority")
+	}
+}
+
+func TestPluginManagedRoleAuthorizationToggleConcurrentLoginDB(t *testing.T) {
+	f := newPluginProviderDBFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	user, key := f.createIdentityUser(ctx, managedRoleUser, nil, nil, "entryUUID:concurrent-role-toggle")
+	provider := f.provider(true)
+
+	toggle, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = toggle.Rollback(context.Background()) }()
+	if _, err := toggle.Exec(ctx, `
+		UPDATE plugin_auth_bindings
+		SET managed_roles_enabled = false
+		WHERE plugin_installation_id = $1 AND capability_id = $2`, f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, loginErr := provider.CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, managedRoleAdmin))
+		result <- loginErr
+	}()
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting int
+		if err := f.pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND application_name = $1
+			  AND wait_event_type = 'Lock'
+			  AND query ILIKE '%FROM plugin_auth_bindings%'
+			  AND query ILIKE '%FOR SHARE%'`, f.prefix).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 1 {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("managed-role login did not wait for the concurrent binding update")
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if err := toggle.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("login accepted administrator claims after the concurrent disable committed")
+	}
+	unchanged, err := NewUserRepository(f.pool).GetByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Role != managedRoleUser {
+		t.Fatalf("concurrent disable/login changed role to %q", unchanged.Role)
+	}
 }
 
 func TestPluginProvisioningConcurrentFirstLoginDB(t *testing.T) {
@@ -338,6 +478,15 @@ func TestPluginManagedRoleSnapshotLifecycleDB(t *testing.T) {
 		repeated.SnapshotAccessGroupID == nil || *repeated.SnapshotAccessGroupID != customGroupID {
 		t.Fatalf("repeat login corrupted snapshot: %+v", repeated)
 	}
+	manualGroupID := f.createGroup(ctx, "manual-admin-change")
+	manualPermissions := []string{}
+	if err := NewUserRepository(f.pool).Update(ctx, user.ID, models.UpdateUserInput{
+		Permissions:      &manualPermissions,
+		AccessGroupIDSet: true,
+		AccessGroupID:    &manualGroupID,
+	}); err != nil {
+		t.Fatalf("change authorization while managed admin: %v", err)
+	}
 
 	demoted, err := provider.CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, "user"))
 	if err != nil {
@@ -396,6 +545,160 @@ func TestPluginManagedRoleDemotionWithoutSnapshotUsesFallbackDB(t *testing.T) {
 	}
 	if valid {
 		t.Fatal("legacy administrator session remained valid after demotion")
+	}
+}
+
+func TestPluginManagedRoleSnapshotEdgeStatesDB(t *testing.T) {
+	t.Run("snapshot present with NULL permissions restores no permissions", func(t *testing.T) {
+		f := newPluginProviderDBFixture(t)
+		ctx := context.Background()
+		user, key := f.createIdentityUser(ctx, managedRoleAdmin, []string{string(PermissionMetadataCuration)}, nil, "entryUUID:null-permissions")
+		if _, err := f.pool.Exec(ctx, `
+			UPDATE plugin_auth_identities
+			SET managed_role_snapshot_present = true,
+			    managed_role_snapshot_permissions = NULL,
+			    managed_role_snapshot_access_group_id = NULL,
+			    managed_role_snapshot_access_group_present = false
+			WHERE plugin_installation_id = $1 AND capability_id = $2 AND external_subject = $3`,
+			key.InstallationID, key.CapabilityID, key.ExternalSubject); err != nil {
+			t.Fatal(err)
+		}
+		demoted, err := f.provider(true).CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, managedRoleUser))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if demoted.Role != managedRoleUser || len(demoted.Permissions) != 0 || demoted.AccessGroupID != nil {
+			t.Fatalf("NULL-permission snapshot restored %+v; want user, empty permissions, nil group", demoted)
+		}
+	})
+
+	t.Run("snapshot present with NULL access group restores ungrouped state", func(t *testing.T) {
+		f := newPluginProviderDBFixture(t)
+		ctx := context.Background()
+		snapshotPermissions := []string{string(PermissionMetadataCuration)}
+		user, key := f.createIdentityUser(ctx, managedRoleAdmin, nil, nil, "entryUUID:null-access-group")
+		if _, err := f.pool.Exec(ctx, `
+			UPDATE plugin_auth_identities
+			SET managed_role_snapshot_present = true,
+			    managed_role_snapshot_permissions = $4,
+			    managed_role_snapshot_access_group_id = NULL,
+			    managed_role_snapshot_access_group_present = false
+			WHERE plugin_installation_id = $1 AND capability_id = $2 AND external_subject = $3`,
+			key.InstallationID, key.CapabilityID, key.ExternalSubject, snapshotPermissions); err != nil {
+			t.Fatal(err)
+		}
+		demoted, err := f.provider(true).CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, managedRoleUser))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(demoted.Permissions, snapshotPermissions) || demoted.AccessGroupID != nil {
+			t.Fatalf("ungrouped snapshot restored permissions=%v group=%v", demoted.Permissions, demoted.AccessGroupID)
+		}
+	})
+
+	t.Run("deleted snapshotted access group falls back to current default", func(t *testing.T) {
+		f := newPluginProviderDBFixture(t)
+		ctx := context.Background()
+		deletedGroupID := f.createGroup(ctx, "deleted-snapshot")
+		snapshotPermissions := []string{string(PermissionMetadataCuration)}
+		user, key := f.createIdentityUser(ctx, managedRoleAdmin, nil, nil, "entryUUID:deleted-access-group")
+		if _, err := f.pool.Exec(ctx, `
+			UPDATE plugin_auth_identities
+			SET managed_role_snapshot_present = true,
+			    managed_role_snapshot_permissions = $4,
+			    managed_role_snapshot_access_group_id = $5,
+			    managed_role_snapshot_access_group_present = true
+			WHERE plugin_installation_id = $1 AND capability_id = $2 AND external_subject = $3`,
+			key.InstallationID, key.CapabilityID, key.ExternalSubject, snapshotPermissions, deletedGroupID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(ctx, `DELETE FROM access_groups WHERE id = $1`, deletedGroupID); err != nil {
+			t.Fatal(err)
+		}
+		defaultGroupID, err := access.NewGroupStore(f.pool).DefaultID(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if defaultGroupID == nil {
+			t.Fatal("security fixture requires a default access group")
+		}
+		demoted, err := f.provider(true).CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, managedRoleUser))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(demoted.Permissions, snapshotPermissions) || !equalOptionalInt64(demoted.AccessGroupID, defaultGroupID) {
+			t.Fatalf("deleted-group snapshot restored permissions=%v group=%v; want %v, %v",
+				demoted.Permissions, demoted.AccessGroupID, snapshotPermissions, defaultGroupID)
+		}
+	})
+
+	t.Run("empty permissions snapshot remains empty", func(t *testing.T) {
+		f := newPluginProviderDBFixture(t)
+		ctx := context.Background()
+		user, key := f.createIdentityUser(ctx, managedRoleAdmin, []string{string(PermissionMetadataCuration)}, nil, "entryUUID:empty-permissions")
+		if _, err := f.pool.Exec(ctx, `
+			UPDATE plugin_auth_identities
+			SET managed_role_snapshot_present = true,
+			    managed_role_snapshot_permissions = ARRAY[]::text[],
+			    managed_role_snapshot_access_group_id = NULL,
+			    managed_role_snapshot_access_group_present = false
+			WHERE plugin_installation_id = $1 AND capability_id = $2 AND external_subject = $3`,
+			key.InstallationID, key.CapabilityID, key.ExternalSubject); err != nil {
+			t.Fatal(err)
+		}
+		demoted, err := f.provider(true).CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, managedRoleUser))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if demoted.Permissions == nil || len(demoted.Permissions) != 0 {
+			t.Fatalf("empty snapshot permissions=%v; want a persisted empty set", demoted.Permissions)
+		}
+	})
+}
+
+func TestPluginManagedRoleDemotionWithoutSnapshotOrDefaultGroupDB(t *testing.T) {
+	f := newPluginProviderDBFixture(t)
+	ctx := context.Background()
+	user, key := f.createIdentityUser(ctx, managedRoleAdmin, nil, nil, "entryUUID:no-default-group")
+	sessionID := uuid.NewString()
+	if err := NewSessionRepository(f.pool).Create(ctx, models.AuthSession{
+		ID:        sessionID,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE access_groups SET is_default = false WHERE is_default`); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := NewPluginIdentityRepository(f.pool).GetTx(ctx, tx, key, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := NewUserRepository(f.pool).GetByIDTx(ctx, tx, user.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	demoted, transition, err := f.provider(true).applyManagedRoleTx(ctx, tx, identity, current, managedRoleUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transition.changed || demoted.Role != managedRoleUser ||
+		!slices.Equal(demoted.Permissions, DefaultUserPermissions()) || demoted.AccessGroupID != nil {
+		t.Fatalf("no-default fallback user=%+v transition=%+v; want default permissions and nil group", demoted, transition)
+	}
+	var revoked bool
+	if err := tx.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM auth_sessions WHERE id = $1`, sessionID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("no-default fallback did not transactionally revoke the main session")
 	}
 }
 

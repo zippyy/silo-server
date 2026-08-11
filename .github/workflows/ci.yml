@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - hardening
   workflow_dispatch:
 
 concurrency:
@@ -173,10 +174,10 @@ jobs:
       - name: Test plugin identity and role transactions
         run: >-
           go test ./internal/auth
-          -run '^TestPlugin(ProvisioningConcurrentFirstLoginDB|ManagedRoleSnapshotLifecycleDB|ManagedRoleDemotionWithoutSnapshotUsesFallbackDB|MalformedManagedRoleDoesNotModifyDB|CapabilityNamespacesDoNotRepointIdentityDB|ProvisioningDuplicatePolicyDB)$'
+          -run '^TestPlugin(ProvisioningConcurrentFirstLoginDB|ManagedRoleAuthorizationFollowsBindingWithoutReconstructionDB|ManagedRoleAuthorizationToggleConcurrentLoginDB|ManagedRoleSnapshotLifecycleDB|ManagedRoleSnapshotEdgeStatesDB|ManagedRoleDemotionWithoutSnapshotUsesFallbackDB|ManagedRoleDemotionWithoutSnapshotOrDefaultGroupDB|MalformedManagedRoleDoesNotModifyDB|CapabilityNamespacesDoNotRepointIdentityDB|ProvisioningDuplicatePolicyDB)$'
           -count=1 -v
 
-      - name: Test stale administrator token revocation
+      - name: Test native and compatibility session revocation
         run: >-
           go test ./internal/api/middleware
           -run '^TestManagedRoleDemotionRejectsExistingAdminTokenDB$'

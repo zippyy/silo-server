@@ -151,6 +151,21 @@ func (s *ABSSessionStore) RevokeTokensForPrincipal(ctx context.Context, userID, 
 	return nil
 }
 
+// RevokeTokensByUserID revokes every active ABS access and refresh token for
+// a Silo account, across all profiles and devices.
+func (s *ABSSessionStore) RevokeTokensByUserID(ctx context.Context, userID int) error {
+	_, err := s.Pool.Exec(ctx, `
+		UPDATE abs_sessions
+		SET revoked_at = now()
+		WHERE user_id = $1 AND revoked_at IS NULL`,
+		userID,
+	)
+	if err != nil {
+		return fmt.Errorf("abs_session_store: revoke user tokens: %w", err)
+	}
+	return nil
+}
+
 // TouchToken bumps last_seen_at for active-session bookkeeping.
 // Errors are logged by the caller; we never gate a valid request on this.
 func (s *ABSSessionStore) TouchToken(ctx context.Context, jti string) error {
