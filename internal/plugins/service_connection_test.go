@@ -554,6 +554,7 @@ func TestServiceTestGlobalConfigUsesMergedDraftAndStopsTemporaryInstance(t *test
 		client pluginClient,
 		manifest *pluginv1.PluginManifest,
 		_ string,
+		_ []*pluginv1.ConfigEntry,
 	) error {
 		probeCalls++
 		if client == nil {
@@ -677,7 +678,7 @@ func TestRunPluginConnectionCheckSkipsMovieProbeForAudiobookOnlyProvider(t *test
 	}
 	client := &fakePluginClient{manifest: manifest}
 
-	if err := runPluginConnectionCheck(context.Background(), client, manifest, "connection"); err != nil {
+	if err := runPluginConnectionCheck(context.Background(), client, manifest, "connection", nil); err != nil {
 		t.Fatalf("runPluginConnectionCheck() error = %v", err)
 	}
 	if client.metadataProviderCalls != 0 {
@@ -740,6 +741,7 @@ func TestServiceTestGlobalConfigStopsTemporaryInstanceOnProbeFailure(t *testing.
 		_ pluginClient,
 		_ *pluginv1.PluginManifest,
 		_ string,
+		_ []*pluginv1.ConfigEntry,
 	) error {
 		return &ConnectionTestError{Message: "probe failed"}
 	}
@@ -788,6 +790,7 @@ func TestServiceTestGlobalConfigUsesUniqueTemporaryInstallationIDs(t *testing.T)
 		_ pluginClient,
 		_ *pluginv1.PluginManifest,
 		_ string,
+		_ []*pluginv1.ConfigEntry,
 	) error {
 		return nil
 	}

@@ -1,14 +1,30 @@
 package pluginhost
 
 import (
+	"context"
 	"errors"
+	"net"
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 )
+
+type testAuthProviderConfigurationServer struct {
+	pluginv1.UnimplementedAuthProviderConfigurationServer
+	request *pluginv1.AuthProviderTestConnectionRequest
+}
+
+func (s *testAuthProviderConfigurationServer) TestConnection(
+	_ context.Context,
+	request *pluginv1.AuthProviderTestConnectionRequest,
+) (*pluginv1.AuthProviderTestConnectionResponse, error) {
+	s.request = request
+	return &pluginv1.AuthProviderTestConnectionResponse{Ok: true, Message: "ok"}, nil
+}
 
 // makeTestClient constructs a Client with the given declared capabilities.
 // It creates a lazy (non-connecting) gRPC ClientConn so that accessors which
@@ -182,4 +198,73 @@ func TestClient_ImageResolver_CapabilityGate(t *testing.T) {
 			t.Errorf("expected ErrCapabilityNotFound, got %v", err)
 		}
 	})
+}
+
+func TestClient_AuthProviderConfiguration_CapabilityGate(t *testing.T) {
+	t.Run("auth provider without typed advertisement is rejected", func(t *testing.T) {
+		client := makeTestClient(t, []*pluginv1.CapabilityDescriptor{{
+			Type: "auth_provider.v1",
+			Id:   "ldap",
+		}})
+		if _, err := client.AuthProviderConfiguration("ldap"); !errors.Is(err, ErrCapabilityNotFound) {
+			t.Fatalf("error = %v, want ErrCapabilityNotFound", err)
+		}
+	})
+
+	t.Run("typed connection test advertisement is accepted", func(t *testing.T) {
+		client := makeTestClient(t, []*pluginv1.CapabilityDescriptor{{
+			Type: "auth_provider.v1",
+			Id:   "ldap",
+			AuthProvider: &pluginv1.AuthProviderDescriptor{
+				ConnectionTest: &pluginv1.AuthProviderConnectionTestDescriptor{ConfigKeys: []string{"ldap"}},
+			},
+		}})
+		configuration, err := client.AuthProviderConfiguration("ldap")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if configuration == nil {
+			t.Fatal("configuration client is nil")
+		}
+	})
+}
+
+func TestAuthProviderConfigurationClientCallsDedicatedRPC(t *testing.T) {
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer()
+	configurationServer := &testAuthProviderConfigurationServer{}
+	pluginv1.RegisterAuthProviderConfigurationServer(server, configurationServer)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	conn, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	client := newClient(1, sdkruntime.NewClient(conn), &pluginv1.PluginManifest{Capabilities: []*pluginv1.CapabilityDescriptor{{
+		Type: "auth_provider.v1",
+		Id:   "ldap",
+		AuthProvider: &pluginv1.AuthProviderDescriptor{
+			ConnectionTest: &pluginv1.AuthProviderConnectionTestDescriptor{ConfigKeys: []string{"ldap"}},
+		},
+	}}})
+	authConfig, err := client.AuthProviderConfiguration("ldap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := authConfig.TestConnection(context.Background(), &pluginv1.AuthProviderTestConnectionRequest{CapabilityId: "ldap"})
+	if err != nil || !response.GetOk() {
+		t.Fatalf("TestConnection() = %#v, %v", response, err)
+	}
+	if configurationServer.request.GetCapabilityId() != "ldap" {
+		t.Fatalf("request = %#v", configurationServer.request)
+	}
 }

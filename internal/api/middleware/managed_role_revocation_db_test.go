@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/audiobooks"
@@ -109,10 +108,10 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	sessions := auth.NewSessionRepository(pool)
 	provider := auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:                installationID,
-			CapabilityID:                  "ldap",
-			AutoProvision:                 true,
-			AdvertisedManagedRoleContract: auth.ManagedRoleContractV1,
+			InstallationID:         installationID,
+			CapabilityID:           "ldap",
+			AutoProvision:          true,
+			AdvertisedManagedRoles: managedRoleDescriptor(),
 		},
 		sessions,
 		userRepo,
@@ -225,10 +224,10 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	}
 	provider = auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:                installationID,
-			CapabilityID:                  "ldap",
-			AutoProvision:                 true,
-			AdvertisedManagedRoleContract: auth.ManagedRoleContractV1,
+			InstallationID:         installationID,
+			CapabilityID:           "ldap",
+			AutoProvision:          true,
+			AdvertisedManagedRoles: managedRoleDescriptor(),
 		},
 		sessions,
 		userRepo,
@@ -239,10 +238,10 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	)
 	failingProvider := auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:                installationID,
-			CapabilityID:                  "ldap",
-			AutoProvision:                 true,
-			AdvertisedManagedRoleContract: auth.ManagedRoleContractV1,
+			InstallationID:         installationID,
+			CapabilityID:           "ldap",
+			AutoProvision:          true,
+			AdvertisedManagedRoles: managedRoleDescriptor(),
 		},
 		nil,
 		userRepo,
@@ -293,13 +292,24 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 
 func managedRoleResponse(t *testing.T, subject, role string) *pluginv1.AuthenticateResponse {
 	t.Helper()
-	claims, err := structpb.NewStruct(map[string]any{
-		"silo_role_contract": auth.ManagedRoleContractV1,
-		"silo_role_managed":  true,
-		"silo_role":          role,
-	})
-	if err != nil {
-		t.Fatal(err)
+	var sdkRole pluginv1.ManagedSiloRole
+	switch role {
+	case "user":
+		sdkRole = pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER
+	case "admin":
+		sdkRole = pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN
+	default:
+		t.Fatalf("unsupported managed role %q", role)
 	}
-	return &pluginv1.AuthenticateResponse{ExternalSubject: subject, Claims: claims}
+	return &pluginv1.AuthenticateResponse{
+		ExternalSubject: subject,
+		ManagedSiloRole: &pluginv1.ManagedSiloRoleAssertion{Role: sdkRole},
+	}
+}
+
+func managedRoleDescriptor() *pluginv1.AuthProviderManagedRoleDescriptor {
+	return &pluginv1.AuthProviderManagedRoleDescriptor{SupportedRoles: []pluginv1.ManagedSiloRole{
+		pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+		pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
+	}}
 }

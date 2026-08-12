@@ -74,6 +74,11 @@ type AuthProviderClient struct {
 	timeout time.Duration
 }
 
+type AuthProviderConfigurationClient struct {
+	client  pluginv1.AuthProviderConfigurationClient
+	timeout time.Duration
+}
+
 type HTTPRoutesClient struct {
 	client  pluginv1.HttpRoutesClient
 	timeout time.Duration
@@ -201,6 +206,23 @@ func (c *Client) AuthProvider(capabilityID string) (*AuthProviderClient, error) 
 	return &AuthProviderClient{
 		client:  c.rpc.AuthProvider(),
 		timeout: DefaultAuthTimeout,
+	}, nil
+}
+
+func (c *Client) AuthProviderConfiguration(capabilityID string) (*AuthProviderConfigurationClient, error) {
+	if err := c.requireCapability("auth_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	descriptor := c.capabilities[capabilityKey("auth_provider.v1", capabilityID)]
+	advertised := descriptor != nil && descriptor.GetAuthProvider().GetConnectionTest() != nil
+	c.mu.RUnlock()
+	if !advertised {
+		return nil, fmt.Errorf("%w: auth_provider.v1/%s configuration test", ErrCapabilityNotFound, capabilityID)
+	}
+	return &AuthProviderConfigurationClient{
+		client:  c.rpc.AuthProviderConfiguration(),
+		timeout: DefaultAuthConfigurationTimeout,
 	}, nil
 }
 
@@ -394,6 +416,15 @@ func (c *AuthProviderClient) ExchangeCode(ctx context.Context, req *pluginv1.Exc
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.client.ExchangeCode(callCtx, req)
+}
+
+func (c *AuthProviderConfigurationClient) TestConnection(
+	ctx context.Context,
+	req *pluginv1.AuthProviderTestConnectionRequest,
+) (*pluginv1.AuthProviderTestConnectionResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.TestConnection(callCtx, req)
 }
 
 func (c *HTTPRoutesClient) Handle(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {

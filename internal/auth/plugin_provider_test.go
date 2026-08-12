@@ -119,13 +119,104 @@ func TestManagedRoleFromResponseFailsClosed(t *testing.T) {
 				}
 				response.Claims = claims
 			}
-			role, managed, err := managedRoleFromResponse(response, test.authority)
+			role, managed, err := managedRoleFromResponse(response, nil, test.authority, test.authority != "")
 			if (err != nil) != test.wantErr || role != test.wantRole || managed != test.wantManaged {
 				t.Fatalf("managedRoleFromResponse() = %q, %v, %v; want %q, %v, wantErr %v",
 					role, managed, err, test.wantRole, test.wantManaged, test.wantErr)
 			}
 		})
 	}
+}
+
+func TestManagedRoleDescriptorFromCapabilityRequiresCompleteLifecycle(t *testing.T) {
+	descriptor := func(roles ...pluginv1.ManagedSiloRole) *pluginv1.CapabilityDescriptor {
+		return &pluginv1.CapabilityDescriptor{AuthProvider: &pluginv1.AuthProviderDescriptor{
+			ManagedRoles: &pluginv1.AuthProviderManagedRoleDescriptor{SupportedRoles: roles},
+		}}
+	}
+	tests := []struct {
+		name    string
+		input   *pluginv1.CapabilityDescriptor
+		wantNil bool
+		wantErr bool
+	}{
+		{name: "not advertised", input: &pluginv1.CapabilityDescriptor{}, wantNil: true},
+		{name: "admin only", input: descriptor(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN), wantErr: true},
+		{name: "duplicate", input: descriptor(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER, pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER), wantErr: true},
+		{name: "unknown", input: descriptor(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER, pluginv1.ManagedSiloRole(99)), wantErr: true},
+		{name: "complete", input: descriptor(
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
+		)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ManagedRoleDescriptorFromCapability(test.input)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+			if test.wantNil && got != nil {
+				t.Fatalf("descriptor = %#v, want nil", got)
+			}
+			if !test.wantNil && !test.wantErr && got == nil {
+				t.Fatal("complete descriptor was rejected")
+			}
+		})
+	}
+}
+
+func TestSDKManagedRoleFromResponseFailsClosed(t *testing.T) {
+	descriptor := &pluginv1.AuthProviderManagedRoleDescriptor{SupportedRoles: []pluginv1.ManagedSiloRole{
+		pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+		pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
+	}}
+	legacyClaims, err := structpb.NewStruct(managedRoleClaims("admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name        string
+		response    *pluginv1.AuthenticateResponse
+		descriptor  *pluginv1.AuthProviderManagedRoleDescriptor
+		authorized  bool
+		wantRole    string
+		wantManaged bool
+		wantErr     bool
+	}{
+		{name: "normal auth", response: &pluginv1.AuthenticateResponse{}, descriptor: descriptor, authorized: true},
+		{name: "operator disabled", response: sdkManagedRoleResponse(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN), descriptor: descriptor, wantErr: true},
+		{name: "not advertised", response: sdkManagedRoleResponse(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN), authorized: true, wantErr: true},
+		{name: "unspecified", response: sdkManagedRoleResponse(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_UNSPECIFIED), descriptor: descriptor, authorized: true, wantErr: true},
+		{name: "unknown", response: sdkManagedRoleResponse(pluginv1.ManagedSiloRole(99)), descriptor: descriptor, authorized: true, wantErr: true},
+		{name: "mixed legacy", response: &pluginv1.AuthenticateResponse{ManagedSiloRole: sdkManagedRoleResponse(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN).ManagedSiloRole, Claims: legacyClaims}, descriptor: descriptor, authorized: true, wantErr: true},
+		{name: "mixed bare legacy role", response: typedResponseWithClaims(t, pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN, map[string]any{managedRoleClaimKey: "admin"}), descriptor: descriptor, authorized: true, wantErr: true},
+		{name: "admin", response: sdkManagedRoleResponse(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN), descriptor: descriptor, authorized: true, wantRole: managedRoleAdmin, wantManaged: true},
+		{name: "user", response: sdkManagedRoleResponse(pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER), descriptor: descriptor, authorized: true, wantRole: managedRoleUser, wantManaged: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			role, managed, err := managedRoleFromResponse(test.response, test.descriptor, "", test.authorized)
+			if (err != nil) != test.wantErr || role != test.wantRole || managed != test.wantManaged {
+				t.Fatalf("managedRoleFromResponse() = %q, %v, %v; want %q, %v, wantErr %v",
+					role, managed, err, test.wantRole, test.wantManaged, test.wantErr)
+			}
+		})
+	}
+}
+
+func typedResponseWithClaims(
+	t *testing.T,
+	role pluginv1.ManagedSiloRole,
+	values map[string]any,
+) *pluginv1.AuthenticateResponse {
+	t.Helper()
+	claims, err := structpb.NewStruct(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := sdkManagedRoleResponse(role)
+	response.Claims = claims
+	return response
 }
 
 func TestProvisionedFallbackEmailUsesStableIdentityNamespace(t *testing.T) {
@@ -193,5 +284,11 @@ func managedRoleClaims(role string) map[string]any {
 		managedRoleMarkerClaimKey:   true,
 		managedRoleContractClaimKey: ManagedRoleContractV1,
 		managedRoleClaimKey:         role,
+	}
+}
+
+func sdkManagedRoleResponse(role pluginv1.ManagedSiloRole) *pluginv1.AuthenticateResponse {
+	return &pluginv1.AuthenticateResponse{
+		ManagedSiloRole: &pluginv1.ManagedSiloRoleAssertion{Role: role},
 	}
 }

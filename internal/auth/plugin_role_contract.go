@@ -4,12 +4,14 @@ import (
 	"fmt"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
-	ManagedRoleContractV1 = "silo.auth.managed-role.v1"
-	managedRoleUser       = "user"
-	managedRoleAdmin      = "admin"
+	ManagedRoleContractV1  = "silo.auth.managed-role.v1"
+	ManagedRoleContractSDK = "sdk.auth_provider.managed_roles"
+	managedRoleUser        = "user"
+	managedRoleAdmin       = "admin"
 
 	managedRoleContractMetadataKey = "managed_role_contract"
 	managedRoleValuesMetadataKey   = "role_values"
@@ -17,6 +19,35 @@ const (
 	managedRoleMarkerClaimKey      = "silo_role_managed"
 	managedRoleClaimKey            = "silo_role"
 )
+
+// ManagedRoleDescriptorFromCapability returns the SDK-owned role contract only
+// when it advertises the complete user/admin lifecycle Silo requires. A
+// provider that can promote but cannot explicitly demote is not authorized.
+func ManagedRoleDescriptorFromCapability(
+	descriptor *pluginv1.CapabilityDescriptor,
+) (*pluginv1.AuthProviderManagedRoleDescriptor, error) {
+	if descriptor == nil || descriptor.GetAuthProvider().GetManagedRoles() == nil {
+		return nil, nil
+	}
+	managedRoles := descriptor.GetAuthProvider().GetManagedRoles()
+	if len(managedRoles.GetSupportedRoles()) != 2 {
+		return nil, fmt.Errorf("managed-role descriptor must advertise exactly user and admin")
+	}
+	seen := make(map[pluginv1.ManagedSiloRole]struct{}, 2)
+	for _, role := range managedRoles.GetSupportedRoles() {
+		switch role {
+		case pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN:
+		default:
+			return nil, fmt.Errorf("managed-role descriptor contains unsupported role %v", role)
+		}
+		if _, duplicate := seen[role]; duplicate {
+			return nil, fmt.Errorf("managed-role descriptor contains duplicate role %v", role)
+		}
+		seen[role] = struct{}{}
+	}
+	return proto.Clone(managedRoles).(*pluginv1.AuthProviderManagedRoleDescriptor), nil
+}
 
 func ManagedRoleContractFromMetadata(metadata map[string]any) (string, error) {
 	contractValue, hasContract := metadata[managedRoleContractMetadataKey]
@@ -57,14 +88,34 @@ func ManagedRoleContractForBinding(metadata map[string]any, enabled bool) (strin
 
 func managedRoleFromResponse(
 	response *pluginv1.AuthenticateResponse,
-	authorizedContract string,
+	advertisedSDKRoles *pluginv1.AuthProviderManagedRoleDescriptor,
+	legacyContract string,
+	operatorAuthorized bool,
 ) (string, bool, error) {
 	managed, err := managedRoleRequested(response)
 	if err != nil || !managed {
 		return "", false, err
 	}
+	if assertion := response.GetManagedSiloRole(); assertion != nil {
+		if !operatorAuthorized || advertisedSDKRoles == nil {
+			return "", false, fmt.Errorf("plugin is not authorized for managed roles")
+		}
+		var role string
+		switch assertion.GetRole() {
+		case pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER:
+			role = managedRoleUser
+		case pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN:
+			role = managedRoleAdmin
+		default:
+			return "", false, fmt.Errorf("plugin managed-role response contains an unsupported role")
+		}
+		if !managedRoleDescriptorSupports(advertisedSDKRoles, assertion.GetRole()) {
+			return "", false, fmt.Errorf("plugin managed-role response was not advertised")
+		}
+		return role, true, nil
+	}
 	claims := response.GetClaims().AsMap()
-	if authorizedContract != ManagedRoleContractV1 {
+	if !operatorAuthorized || legacyContract != ManagedRoleContractV1 {
 		return "", false, fmt.Errorf("plugin is not authorized for managed roles")
 	}
 	contract, ok := claims[managedRoleContractClaimKey].(string)
@@ -79,19 +130,43 @@ func managedRoleFromResponse(
 }
 
 func managedRoleRequested(response *pluginv1.AuthenticateResponse) (bool, error) {
-	if response == nil || response.GetClaims() == nil {
+	if response == nil {
 		return false, nil
+	}
+	typed := response.GetManagedSiloRole() != nil
+	if response.GetClaims() == nil {
+		return typed, nil
 	}
 	claims := response.GetClaims().AsMap()
 	rawMarker, hasMarker := claims[managedRoleMarkerClaimKey]
+	_, hasContract := claims[managedRoleContractClaimKey]
+	_, hasRole := claims[managedRoleClaimKey]
+	if typed && (hasMarker || hasContract || hasRole) {
+		return false, fmt.Errorf("plugin auth response mixes typed and legacy managed-role contracts")
+	}
 	if !hasMarker {
-		return false, nil
+		return typed, nil
 	}
 	managed, ok := rawMarker.(bool)
 	if !ok {
 		return false, fmt.Errorf("plugin auth claim %q must be a boolean", managedRoleMarkerClaimKey)
 	}
 	return managed, nil
+}
+
+func managedRoleDescriptorSupports(
+	descriptor *pluginv1.AuthProviderManagedRoleDescriptor,
+	wanted pluginv1.ManagedSiloRole,
+) bool {
+	if descriptor == nil {
+		return false
+	}
+	for _, role := range descriptor.GetSupportedRoles() {
+		if role == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func strictStringSet(value any) (map[string]struct{}, bool) {

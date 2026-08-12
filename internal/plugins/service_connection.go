@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
@@ -37,12 +38,14 @@ func (e *ConnectionTestError) Unwrap() error {
 }
 
 type pluginConnectionCheckCapability struct {
-	kind string
-	id   string
+	kind       string
+	id         string
+	configKeys []string
 }
 
 const (
 	connectionCheckKindMetadata = "metadata_provider"
+	connectionCheckKindAuth     = "auth_provider"
 	authProviderCapabilityType  = "auth_provider.v1"
 )
 
@@ -51,6 +54,7 @@ var runPluginConnectionCheck = func(
 	client pluginClient,
 	manifest *pluginv1.PluginManifest,
 	configKey string,
+	configEntries []*pluginv1.ConfigEntry,
 ) error {
 	capability, err := pluginConnectionCheckCapabilityForManifest(manifest, configKey)
 	if err != nil {
@@ -58,6 +62,8 @@ var runPluginConnectionCheck = func(
 	}
 
 	switch capability.kind {
+	case connectionCheckKindAuth:
+		return runAuthProviderConnectionCheck(ctx, client, capability, configEntries)
 	case connectionCheckKindMetadata:
 		return runMetadataProviderConnectionCheck(ctx, client, manifest, capability.id)
 	default:
@@ -66,6 +72,66 @@ var runPluginConnectionCheck = func(
 			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
+}
+
+func runAuthProviderConnectionCheck(
+	ctx context.Context,
+	client pluginClient,
+	capability pluginConnectionCheckCapability,
+	configEntries []*pluginv1.ConfigEntry,
+) error {
+	authClient, err := client.AuthProviderConfiguration(capability.id)
+	if err != nil {
+		return &ConnectionTestError{
+			Message: "Failed to initialize the authentication provider connection check.",
+			Cause:   err,
+		}
+	}
+
+	ownedEntries := authProviderConnectionTestEntries(capability.configKeys, configEntries)
+
+	response, err := authClient.TestConnection(ctx, &pluginv1.AuthProviderTestConnectionRequest{
+		CapabilityId: capability.id,
+		Config:       ownedEntries,
+	})
+	if err != nil {
+		return &ConnectionTestError{
+			Message: "Authentication-provider connection check failed.",
+			Cause:   err,
+		}
+	}
+	if response == nil || !response.GetOk() {
+		message := "Authentication-provider connection check failed."
+		if response != nil && strings.TrimSpace(response.GetMessage()) != "" {
+			message = strings.TrimSpace(response.GetMessage())
+		}
+		return &ConnectionTestError{Message: message}
+	}
+	return nil
+}
+
+func authProviderConnectionTestEntries(
+	configKeys []string,
+	configEntries []*pluginv1.ConfigEntry,
+) []*pluginv1.ConfigEntry {
+	entriesByKey := make(map[string]*pluginv1.ConfigEntry, len(configEntries))
+	for _, entry := range configEntries {
+		if entry != nil {
+			entriesByKey[entry.GetKey()] = entry
+		}
+	}
+	ownedEntries := make([]*pluginv1.ConfigEntry, 0, len(configKeys))
+	for _, key := range configKeys {
+		if entry := entriesByKey[key]; entry != nil {
+			ownedEntries = append(ownedEntries, proto.Clone(entry).(*pluginv1.ConfigEntry))
+			continue
+		}
+		ownedEntries = append(ownedEntries, &pluginv1.ConfigEntry{
+			Key:   key,
+			Value: &structpb.Struct{},
+		})
+	}
+	return ownedEntries
 }
 
 func runMetadataProviderConnectionCheck(
@@ -172,13 +238,19 @@ func (s *Service) TestGlobalConfigWithClears(
 			Cause:   err,
 		}
 	}
-	if _, err := pluginConnectionCheckCapabilityForManifest(manifest, key); err != nil {
+	checkCapability, err := pluginConnectionCheckCapabilityForManifest(manifest, key)
+	if err != nil {
 		return err
 	}
 
 	configEntries, err := s.mergedGlobalConfigEntries(ctx, installationID, key, value)
 	if err != nil {
 		return err
+	}
+	if checkCapability.kind == connectionCheckKindAuth {
+		// Runtime.Configure is process-wide, so scope the temporary instance as
+		// well as the TestConnection RPC to the auth capability's declared keys.
+		configEntries = authProviderConnectionTestEntries(checkCapability.configKeys, configEntries)
 	}
 
 	testInstallationID := -int(s.testConfigSeq.Add(1))
@@ -206,7 +278,7 @@ func (s *Service) TestGlobalConfigWithClears(
 		}
 	}()
 
-	return runPluginConnectionCheck(ctx, client, manifest, key)
+	return runPluginConnectionCheck(ctx, client, manifest, key, configEntries)
 }
 
 func (s *Service) mergedGlobalConfigEntries(
@@ -290,8 +362,32 @@ func pluginConnectionCheckCapabilityForManifest(
 	configKey string,
 ) (pluginConnectionCheckCapability, error) {
 	if manifestHasAuthProvider(manifest) {
+		var selected *pluginConnectionCheckCapability
+		for _, descriptor := range manifest.GetCapabilities() {
+			if descriptor.GetType() != authProviderCapabilityType {
+				continue
+			}
+			connectionTest := descriptor.GetAuthProvider().GetConnectionTest()
+			if connectionTest == nil || !containsString(connectionTest.GetConfigKeys(), configKey) {
+				continue
+			}
+			if selected != nil {
+				return pluginConnectionCheckCapability{}, &ConnectionTestError{
+					Message: fmt.Sprintf("Multiple authentication providers advertise connection checks for configuration key %q.", configKey),
+					Cause:   ErrConnectionTestUnsupported,
+				}
+			}
+			selected = &pluginConnectionCheckCapability{
+				kind:       connectionCheckKindAuth,
+				id:         descriptor.GetId(),
+				configKeys: append([]string(nil), connectionTest.GetConfigKeys()...),
+			}
+		}
+		if selected != nil {
+			return *selected, nil
+		}
 		return pluginConnectionCheckCapability{}, &ConnectionTestError{
-			Message: fmt.Sprintf("Authentication-provider connection checks are not supported for configuration key %q yet.", configKey),
+			Message: fmt.Sprintf("Authentication-provider connection checks are not supported for configuration key %q.", configKey),
 			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
@@ -305,6 +401,15 @@ func pluginConnectionCheckCapabilityForManifest(
 		Message: "Connection checks are not supported for this plugin yet.",
 		Cause:   ErrConnectionTestUnsupported,
 	}
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func manifestHasAuthProvider(manifest *pluginv1.PluginManifest) bool {

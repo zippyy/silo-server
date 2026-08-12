@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -111,17 +110,20 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 }
 
 func (f *pluginProviderDBFixture) provider(managed bool) *PluginProvider {
-	contract := ""
+	var descriptor *pluginv1.AuthProviderManagedRoleDescriptor
 	if managed {
-		contract = ManagedRoleContractV1
+		descriptor = &pluginv1.AuthProviderManagedRoleDescriptor{SupportedRoles: []pluginv1.ManagedSiloRole{
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
+		}}
 	}
 	return NewPluginProviderWithClientFactory(
 		PluginProviderConfig{
-			InstallationID:                f.installationID,
-			CapabilityID:                  f.capabilityID,
-			DisplayName:                   "LDAP",
-			AutoProvision:                 true,
-			AdvertisedManagedRoleContract: contract,
+			InstallationID:         f.installationID,
+			CapabilityID:           f.capabilityID,
+			DisplayName:            "LDAP",
+			AutoProvision:          true,
+			AdvertisedManagedRoles: descriptor,
 		},
 		NewSessionRepository(f.pool),
 		NewUserRepository(f.pool),
@@ -138,11 +140,14 @@ func (f *pluginProviderDBFixture) response(subject, displayName, email, role str
 		Email:           email,
 	}
 	if role != "" {
-		claims, err := structpb.NewStruct(managedRoleClaims(role))
-		if err != nil {
-			f.t.Fatalf("build managed-role claims: %v", err)
+		switch role {
+		case managedRoleUser:
+			response.ManagedSiloRole = &pluginv1.ManagedSiloRoleAssertion{Role: pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER}
+		case managedRoleAdmin:
+			response.ManagedSiloRole = &pluginv1.ManagedSiloRoleAssertion{Role: pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN}
+		default:
+			f.t.Fatalf("unsupported fixture role %q", role)
 		}
-		response.Claims = claims
 	}
 	return response
 }
@@ -709,15 +714,7 @@ func TestPluginMalformedManagedRoleDoesNotModifyDB(t *testing.T) {
 	permissions := []string{string(PermissionMetadataCuration)}
 	user, key := f.createIdentityUser(ctx, "user", permissions, &customGroupID, "entryUUID:malformed-role")
 	response := f.response(key.ExternalSubject, user.Username, user.Email, "")
-	claims, err := structpb.NewStruct(map[string]any{
-		managedRoleMarkerClaimKey:   true,
-		managedRoleContractClaimKey: "silo.auth.managed-role.v2",
-		managedRoleClaimKey:         "admin",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.Claims = claims
+	response.ManagedSiloRole = &pluginv1.ManagedSiloRoleAssertion{Role: pluginv1.ManagedSiloRole(99)}
 
 	if _, err := f.provider(true).CompleteOAuth(ctx, response); err == nil {
 		t.Fatal("malformed managed-role claims unexpectedly succeeded")

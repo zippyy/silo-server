@@ -36,6 +36,7 @@ type pluginClient interface {
 	RequestRouter(capabilityID string) (*pluginhost.RequestRouterClient, error)
 	EventConsumer(capabilityID string) (*pluginhost.EventConsumerClient, error)
 	AuthProvider(capabilityID string) (*pluginhost.AuthProviderClient, error)
+	AuthProviderConfiguration(capabilityID string) (*pluginhost.AuthProviderConfigurationClient, error)
 	HTTPRoutes(capabilityID string) (*pluginhost.HTTPRoutesClient, error)
 	WatchSyncProvider(capabilityID string) (*pluginhost.WatchSyncProviderClient, error)
 }

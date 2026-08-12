@@ -233,6 +233,10 @@ func (f *fakePluginClient) AuthProvider(string) (*pluginhost.AuthProviderClient,
 	return nil, nil
 }
 
+func (f *fakePluginClient) AuthProviderConfiguration(string) (*pluginhost.AuthProviderConfigurationClient, error) {
+	return nil, nil
+}
+
 func (f *fakePluginClient) HTTPRoutes(string) (*pluginhost.HTTPRoutesClient, error) {
 	return nil, nil
 }

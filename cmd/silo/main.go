@@ -2343,21 +2343,47 @@ func main() {
 			displayName := binding.CapabilityID
 			mode := "credentials"
 			iconURL := ""
+			var managedRoles *pluginv1.AuthProviderManagedRoleDescriptor
 			managedRoleContract := ""
 			capabilities, err := pluginInstallationStore.ListCapabilities(appCtx, binding.InstallationID)
 			if err == nil {
 				for _, capability := range capabilities {
 					if capability != nil && capability.Type == "auth_provider.v1" && capability.ID == binding.CapabilityID {
-						contract, contractErr := auth.ManagedRoleContractFromMetadata(capability.Metadata)
-						if contractErr != nil {
+						descriptor, descriptorErr := plugins.DecodeCapability(capability)
+						if descriptorErr != nil {
+							slog.WarnContext(appCtx, "ignoring malformed auth-provider descriptor",
+								"component", "auth",
+								"plugin_installation_id", binding.InstallationID,
+								"capability_id", binding.CapabilityID,
+								"error", descriptorErr,
+							)
+							break
+						}
+						managedRoles, descriptorErr = auth.ManagedRoleDescriptorFromCapability(descriptor)
+						if descriptorErr != nil {
 							slog.WarnContext(appCtx, "ignoring malformed managed-role advertisement",
 								"component", "auth",
 								"plugin_installation_id", binding.InstallationID,
 								"capability_id", binding.CapabilityID,
-								"error", contractErr,
+								"error", descriptorErr,
 							)
-						} else {
-							managedRoleContract = contract
+							managedRoles = nil
+						} else if managedRoles == nil {
+							legacyMetadata := map[string]any{}
+							if descriptor.GetMetadata() != nil {
+								legacyMetadata = descriptor.GetMetadata().AsMap()
+							}
+							contract, contractErr := auth.ManagedRoleContractFromMetadata(legacyMetadata)
+							if contractErr != nil {
+								slog.WarnContext(appCtx, "ignoring malformed legacy managed-role advertisement",
+									"component", "auth",
+									"plugin_installation_id", binding.InstallationID,
+									"capability_id", binding.CapabilityID,
+									"error", contractErr,
+								)
+							} else {
+								managedRoleContract = contract
+							}
 						}
 						if name, ok := capability.Metadata["display_name"].(string); ok && strings.TrimSpace(name) != "" {
 							displayName = name
@@ -2423,6 +2449,7 @@ func main() {
 						CapabilityID:                  binding.CapabilityID,
 						DisplayName:                   displayName,
 						AutoProvision:                 binding.AutoProvision,
+						AdvertisedManagedRoles:        managedRoles,
 						AdvertisedManagedRoleContract: managedRoleContract,
 					},
 					sessionRepo,

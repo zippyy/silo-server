@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/proto"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -66,6 +67,7 @@ type PluginProviderConfig struct {
 	CapabilityID                  string
 	DisplayName                   string
 	AutoProvision                 bool
+	AdvertisedManagedRoles        *pluginv1.AuthProviderManagedRoleDescriptor
 	AdvertisedManagedRoleContract string
 }
 
@@ -88,6 +90,9 @@ func NewPluginProviderWithClientFactory(
 	clientFactory pluginAuthClientFactory,
 	options ...PluginProviderOption,
 ) *PluginProvider {
+	if config.AdvertisedManagedRoles != nil {
+		config.AdvertisedManagedRoles = proto.Clone(config.AdvertisedManagedRoles).(*pluginv1.AuthProviderManagedRoleDescriptor)
+	}
 	provider := &PluginProvider{
 		config:       config,
 		client:       clientFactory,
@@ -419,8 +424,10 @@ func (p *PluginProvider) managedRoleFromResponseTx(
 	tx pgx.Tx,
 	response *pluginv1.AuthenticateResponse,
 ) (string, bool, error) {
-	authorizedContract := ""
-	if p.config.AdvertisedManagedRoleContract == ManagedRoleContractV1 && p.managedRoleBindings != nil {
+	operatorAuthorized := false
+	hasAdvertisement := p.config.AdvertisedManagedRoles != nil ||
+		p.config.AdvertisedManagedRoleContract == ManagedRoleContractV1
+	if hasAdvertisement && p.managedRoleBindings != nil {
 		binding, err := p.managedRoleBindings.GetAuthBindingTx(
 			ctx, tx, p.config.InstallationID, p.config.CapabilityID,
 		)
@@ -429,10 +436,15 @@ func (p *PluginProvider) managedRoleFromResponseTx(
 				return "", false, fmt.Errorf("load managed-role authorization: %w", err)
 			}
 		} else if binding.Enabled && binding.ManagedRolesEnabled {
-			authorizedContract = p.config.AdvertisedManagedRoleContract
+			operatorAuthorized = true
 		}
 	}
-	return managedRoleFromResponse(response, authorizedContract)
+	return managedRoleFromResponse(
+		response,
+		p.config.AdvertisedManagedRoles,
+		p.config.AdvertisedManagedRoleContract,
+		operatorAuthorized,
+	)
 }
 
 type roleTransition struct {
@@ -549,8 +561,15 @@ func (p *PluginProvider) logRoleTransition(ctx context.Context, userID int, tran
 		"user_id", userID,
 		"previous_role", transition.previous,
 		"new_role", transition.next,
-		"contract", p.config.AdvertisedManagedRoleContract,
+		"contract", p.managedRoleContractName(),
 	)
+}
+
+func (p *PluginProvider) managedRoleContractName() string {
+	if p.config.AdvertisedManagedRoles != nil {
+		return ManagedRoleContractSDK
+	}
+	return p.config.AdvertisedManagedRoleContract
 }
 
 func provisionedUsernameBase(response *pluginv1.AuthenticateResponse, creds Credentials, installationID int) string {
