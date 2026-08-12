@@ -43,6 +43,14 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	if err != nil {
 		t.Fatalf("parse test database URL: %v", err)
 	}
+	// The concurrency fixtures hold several connections at once: a table
+	// blocker plus two concurrent logins, each of which keeps its authority
+	// decision transaction open while the provisioning transaction runs, plus
+	// the pg_stat_activity poll. The pgxpool default of max(4, NumCPU) is
+	// enough on a workstation but starves the blocker/poll on 2-vCPU CI
+	// runners. Give the fixture a fixed ceiling so connection count is
+	// deterministic regardless of runner size.
+	poolConfig.MaxConns = 12
 	poolConfig.ConnConfig.RuntimeParams["application_name"] = prefix
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
