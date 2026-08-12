@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
@@ -16,6 +17,60 @@ import (
 type testAuthProviderConfigurationServer struct {
 	pluginv1.UnimplementedAuthProviderConfigurationServer
 	request *pluginv1.AuthProviderTestConnectionRequest
+}
+
+type capturingAuthProviderClient struct {
+	capabilityIDs []string
+}
+
+func (c *capturingAuthProviderClient) record(id string) {
+	c.capabilityIDs = append(c.capabilityIDs, id)
+}
+
+func (c *capturingAuthProviderClient) Authenticate(_ context.Context, req *pluginv1.AuthenticateRequest, _ ...grpc.CallOption) (*pluginv1.AuthenticateResponse, error) {
+	c.record(req.GetCapabilityId())
+	return &pluginv1.AuthenticateResponse{}, nil
+}
+
+func (c *capturingAuthProviderClient) InitAuthorize(_ context.Context, req *pluginv1.InitAuthorizeRequest, _ ...grpc.CallOption) (*pluginv1.InitAuthorizeResponse, error) {
+	c.record(req.GetCapabilityId())
+	return &pluginv1.InitAuthorizeResponse{}, nil
+}
+
+func (c *capturingAuthProviderClient) ExchangeCode(_ context.Context, req *pluginv1.ExchangeCodeRequest, _ ...grpc.CallOption) (*pluginv1.AuthenticateResponse, error) {
+	c.record(req.GetCapabilityId())
+	return &pluginv1.AuthenticateResponse{}, nil
+}
+
+func (c *capturingAuthProviderClient) RefreshSession(_ context.Context, req *pluginv1.RefreshSessionRequest, _ ...grpc.CallOption) (*pluginv1.AuthenticateResponse, error) {
+	c.record(req.GetCapabilityId())
+	return &pluginv1.AuthenticateResponse{}, nil
+}
+
+func TestAuthProviderClientScopesEveryRequestToCapability(t *testing.T) {
+	captured := &capturingAuthProviderClient{}
+	client := &AuthProviderClient{client: captured, timeout: time.Second, capabilityID: "ldap"}
+	ctx := context.Background()
+	if _, err := client.Authenticate(ctx, &pluginv1.AuthenticateRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.InitAuthorize(ctx, &pluginv1.InitAuthorizeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ExchangeCode(ctx, &pluginv1.ExchangeCodeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RefreshSession(ctx, &pluginv1.RefreshSessionRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured.capabilityIDs) != 4 {
+		t.Fatalf("captured %d requests, want 4", len(captured.capabilityIDs))
+	}
+	for index, id := range captured.capabilityIDs {
+		if id != "ldap" {
+			t.Fatalf("request %d capability_id=%q, want ldap", index, id)
+		}
+	}
 }
 
 func (s *testAuthProviderConfigurationServer) TestConnection(

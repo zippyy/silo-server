@@ -96,7 +96,7 @@ func (h *OAuthHandler) HandleInit(w http.ResponseWriter, r *http.Request) {
 
 	next := normalizeOAuthNext(r.URL.Query().Get("next"))
 
-	client, _, err := h.deps.ResolveClient(r.Context(), installID)
+	client, capabilityID, err := h.deps.ResolveClient(r.Context(), installID)
 	if err != nil {
 		http.Error(w, "auth plugin unavailable", http.StatusBadGateway)
 		return
@@ -117,8 +117,9 @@ func (h *OAuthHandler) HandleInit(w http.ResponseWriter, r *http.Request) {
 	redirectURI := strings.TrimRight(h.deps.HostBaseURL, "/") + "/api/v1/auth/oauth/" + strconv.Itoa(installID) + "/callback"
 
 	resp, err := client.InitAuthorize(r.Context(), &pluginv1.InitAuthorizeRequest{
-		RedirectUri: redirectURI,
-		State:       state,
+		RedirectUri:  redirectURI,
+		State:        state,
+		CapabilityId: capabilityID,
 		// Linking is wired in a follow-up — see TODO below.
 	})
 	if err != nil {
@@ -196,6 +197,7 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		State:         state,
 		RedirectUri:   sess.RedirectURI,
 		ProviderState: psStruct,
+		CapabilityId:  capabilityID,
 	})
 	if err != nil {
 		slog.WarnContext(r.Context(), "oauth exchange_code failed", "component", "auth", "installation_id", installID, "error", err)

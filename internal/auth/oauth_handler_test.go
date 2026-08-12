@@ -110,6 +110,8 @@ func TestOAuthInit_Redirects302WithAuthorizeURL(t *testing.T) {
 	// Plugin received our state.
 	if fc.gotInit == nil || fc.gotInit.GetState() == "" {
 		t.Error("plugin not invoked or empty state")
+	} else if fc.gotInit.GetCapabilityId() != "whmcs" {
+		t.Errorf("init capability_id = %q, want whmcs", fc.gotInit.GetCapabilityId())
 	}
 }
 
@@ -198,6 +200,12 @@ func TestOAuthCallback_HappyPath_DeliversOneTimeCompletionCode(t *testing.T) {
 
 	if wCb.Code != http.StatusFound {
 		t.Fatalf("callback code = %d body = %s", wCb.Code, wCb.Body.String())
+	}
+	if fc.gotExchange == nil {
+		t.Fatal("exchange request was not captured")
+	}
+	if fc.gotExchange.GetCapabilityId() != "whmcs" {
+		t.Fatalf("exchange capability_id = %q, want whmcs", fc.gotExchange.GetCapabilityId())
 	}
 	loc := wCb.Header().Get("Location")
 	if !strings.HasPrefix(loc, "https://silo.test/login/oauth-complete?") {

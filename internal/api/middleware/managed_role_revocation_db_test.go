@@ -70,6 +70,12 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 		}
 	})
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO plugin_capabilities (
+			plugin_installation_id, capability_type, capability_id, metadata
+		) VALUES ($1, 'auth_provider.v1', 'ldap', '{"auth_provider":{"managed_roles":{"supported_roles":["MANAGED_SILO_ROLE_USER","MANAGED_SILO_ROLE_ADMIN"]}}}'::jsonb)`, installationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO plugin_auth_bindings (
 			plugin_installation_id, capability_id, enabled, auto_provision, managed_roles_enabled
 		)
@@ -108,16 +114,14 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	sessions := auth.NewSessionRepository(pool)
 	provider := auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:         installationID,
-			CapabilityID:           "ldap",
-			AutoProvision:          true,
-			AdvertisedManagedRoles: managedRoleDescriptor(),
+			InstallationID: installationID,
+			CapabilityID:   "ldap",
 		},
 		sessions,
 		userRepo,
 		pool,
 		nil,
-		auth.WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(pool)),
+		auth.WithAuthProviderAuthorityStore(plugins.NewRuntimeConfigStore(pool)),
 	)
 	response := managedRoleResponse(t, key.ExternalSubject, "admin")
 	promoted, err := provider.CompleteOAuth(ctx, response)
@@ -224,30 +228,26 @@ func TestManagedRoleDemotionRejectsExistingAdminTokenDB(t *testing.T) {
 	}
 	provider = auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:         installationID,
-			CapabilityID:           "ldap",
-			AutoProvision:          true,
-			AdvertisedManagedRoles: managedRoleDescriptor(),
+			InstallationID: installationID,
+			CapabilityID:   "ldap",
 		},
 		sessions,
 		userRepo,
 		pool,
 		nil,
-		auth.WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(pool)),
+		auth.WithAuthProviderAuthorityStore(plugins.NewRuntimeConfigStore(pool)),
 		auth.WithUserSessionRevoker(revokeCompat),
 	)
 	failingProvider := auth.NewPluginProviderWithClientFactory(
 		auth.PluginProviderConfig{
-			InstallationID:         installationID,
-			CapabilityID:           "ldap",
-			AutoProvision:          true,
-			AdvertisedManagedRoles: managedRoleDescriptor(),
+			InstallationID: installationID,
+			CapabilityID:   "ldap",
 		},
 		nil,
 		userRepo,
 		pool,
 		nil,
-		auth.WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(pool)),
+		auth.WithAuthProviderAuthorityStore(plugins.NewRuntimeConfigStore(pool)),
 		auth.WithUserSessionRevoker(revokeCompat),
 	)
 	if _, err := failingProvider.CompleteOAuth(ctx, managedRoleResponse(t, key.ExternalSubject, "user")); err == nil {
@@ -305,11 +305,4 @@ func managedRoleResponse(t *testing.T, subject, role string) *pluginv1.Authentic
 		ExternalSubject: subject,
 		ManagedSiloRole: &pluginv1.ManagedSiloRoleAssertion{Role: sdkRole},
 	}
-}
-
-func managedRoleDescriptor() *pluginv1.AuthProviderManagedRoleDescriptor {
-	return &pluginv1.AuthProviderManagedRoleDescriptor{SupportedRoles: []pluginv1.ManagedSiloRole{
-		pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
-		pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
-	}}
 }

@@ -70,8 +70,9 @@ type EventConsumerClient struct {
 }
 
 type AuthProviderClient struct {
-	client  pluginv1.AuthProviderClient
-	timeout time.Duration
+	client       pluginv1.AuthProviderClient
+	timeout      time.Duration
+	capabilityID string
 }
 
 type AuthProviderConfigurationClient struct {
@@ -204,8 +205,9 @@ func (c *Client) AuthProvider(capabilityID string) (*AuthProviderClient, error) 
 		return nil, err
 	}
 	return &AuthProviderClient{
-		client:  c.rpc.AuthProvider(),
-		timeout: DefaultAuthTimeout,
+		client:       c.rpc.AuthProvider(),
+		timeout:      DefaultAuthTimeout,
+		capabilityID: capabilityID,
 	}, nil
 }
 
@@ -401,21 +403,31 @@ func (c *EventConsumerClient) HandleEvent(ctx context.Context, req *pluginv1.Han
 }
 
 func (c *AuthProviderClient) Authenticate(ctx context.Context, req *pluginv1.AuthenticateRequest) (*pluginv1.AuthenticateResponse, error) {
+	req.CapabilityId = c.capabilityID
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.client.Authenticate(callCtx, req)
 }
 
 func (c *AuthProviderClient) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthorizeRequest) (*pluginv1.InitAuthorizeResponse, error) {
+	req.CapabilityId = c.capabilityID
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.client.InitAuthorize(callCtx, req)
 }
 
 func (c *AuthProviderClient) ExchangeCode(ctx context.Context, req *pluginv1.ExchangeCodeRequest) (*pluginv1.AuthenticateResponse, error) {
+	req.CapabilityId = c.capabilityID
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.client.ExchangeCode(callCtx, req)
+}
+
+func (c *AuthProviderClient) RefreshSession(ctx context.Context, req *pluginv1.RefreshSessionRequest) (*pluginv1.AuthenticateResponse, error) {
+	req.CapabilityId = c.capabilityID
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.RefreshSession(callCtx, req)
 }
 
 func (c *AuthProviderConfigurationClient) TestConnection(

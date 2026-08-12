@@ -41,6 +41,15 @@ type AuthBinding struct {
 	UpdatedAt           time.Time
 }
 
+// AuthProviderAuthority is the persisted state used for an authentication
+// decision. Callers load it inside their transaction so binding and installed
+// capability changes are serialized against the decision.
+type AuthProviderAuthority struct {
+	Binding             *AuthBinding
+	InstallationEnabled bool
+	CapabilityMetadata  map[string]any
+}
+
 type TaskBinding struct {
 	InstallationID int
 	CapabilityID   string
@@ -392,6 +401,56 @@ func (s *RuntimeConfigStore) GetAuthBindingTx(
 	capabilityID string,
 ) (*AuthBinding, error) {
 	return getAuthBinding(ctx, tx, installationID, capabilityID, true)
+}
+
+// GetAuthProviderAuthorityTx share-locks every persisted row that grants an
+// auth provider authority. Missing bindings or capabilities fail closed.
+func (s *RuntimeConfigStore) GetAuthProviderAuthorityTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID int,
+	capabilityID string,
+) (*AuthProviderAuthority, error) {
+	var installationEnabled bool
+	if err := tx.QueryRow(ctx, `
+		SELECT enabled
+		FROM plugin_installations
+		WHERE id = $1
+		FOR SHARE`, installationID).Scan(&installationEnabled); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInstallationNotFound
+		}
+		return nil, fmt.Errorf("getting auth provider installation: %w", err)
+	}
+
+	var metadataJSON []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT metadata
+		FROM plugin_capabilities
+		WHERE plugin_installation_id = $1
+		  AND capability_type = 'auth_provider.v1'
+		  AND capability_id = $2
+		FOR SHARE`, installationID, capabilityID).Scan(&metadataJSON); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAuthBindingNotFound
+		}
+		return nil, fmt.Errorf("getting installed auth capability: %w", err)
+	}
+	metadata := map[string]any{}
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &metadata); err != nil {
+			return nil, fmt.Errorf("decoding installed auth capability metadata: %w", err)
+		}
+	}
+	binding, err := s.GetAuthBindingTx(ctx, tx, installationID, capabilityID)
+	if err != nil {
+		return nil, err
+	}
+	return &AuthProviderAuthority{
+		Binding:             binding,
+		InstallationEnabled: installationEnabled,
+		CapabilityMetadata:  metadata,
+	}, nil
 }
 
 func getAuthBinding(

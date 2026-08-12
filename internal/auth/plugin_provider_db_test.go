@@ -80,6 +80,13 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	}
 	capabilityID := "ldap"
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO plugin_capabilities (
+			plugin_installation_id, capability_type, capability_id, metadata
+		) VALUES ($1, 'auth_provider.v1', $2, '{"auth_provider":{"managed_roles":{"supported_roles":["MANAGED_SILO_ROLE_USER","MANAGED_SILO_ROLE_ADMIN"]}}}'::jsonb)`, installationID, capabilityID); err != nil {
+		pool.Close()
+		t.Fatalf("create plugin auth capability: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO plugin_auth_bindings (
 			plugin_installation_id, capability_id, enabled, auto_provision, managed_roles_enabled
 		) VALUES ($1, $2, true, true, true)`, installationID, capabilityID); err != nil {
@@ -109,27 +116,17 @@ func newPluginProviderDBFixture(t *testing.T) *pluginProviderDBFixture {
 	return fixture
 }
 
-func (f *pluginProviderDBFixture) provider(managed bool) *PluginProvider {
-	var descriptor *pluginv1.AuthProviderManagedRoleDescriptor
-	if managed {
-		descriptor = &pluginv1.AuthProviderManagedRoleDescriptor{SupportedRoles: []pluginv1.ManagedSiloRole{
-			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
-			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
-		}}
-	}
+func (f *pluginProviderDBFixture) provider(_ bool) *PluginProvider {
 	return NewPluginProviderWithClientFactory(
 		PluginProviderConfig{
-			InstallationID:         f.installationID,
-			CapabilityID:           f.capabilityID,
-			DisplayName:            "LDAP",
-			AutoProvision:          true,
-			AdvertisedManagedRoles: descriptor,
+			InstallationID: f.installationID,
+			CapabilityID:   f.capabilityID,
 		},
 		NewSessionRepository(f.pool),
 		NewUserRepository(f.pool),
 		f.pool,
 		nil,
-		WithManagedRoleBindingStore(plugins.NewRuntimeConfigStore(f.pool)),
+		WithAuthProviderAuthorityStore(plugins.NewRuntimeConfigStore(f.pool)),
 	)
 }
 
@@ -337,6 +334,208 @@ func TestPluginManagedRoleAuthorizationToggleConcurrentLoginDB(t *testing.T) {
 	}
 	if unchanged.Role != managedRoleUser {
 		t.Fatalf("concurrent disable/login changed role to %q", unchanged.Role)
+	}
+}
+
+func TestPluginAuthenticationFollowsBindingWithoutReconstructionDB(t *testing.T) {
+	f := newPluginProviderDBFixture(t)
+	ctx := context.Background()
+	provider := f.provider(false)
+	store := plugins.NewRuntimeConfigStore(f.pool)
+	binding, err := store.GetAuthBinding(ctx, f.installationID, f.capabilityID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	existing, key := f.createIdentityUser(ctx, managedRoleUser, nil, nil, "entryUUID:dynamic-binding")
+	response := f.response(key.ExternalSubject, existing.Username, existing.Email, "")
+	if _, err := provider.CompleteOAuth(ctx, response); err != nil {
+		t.Fatalf("enabled binding rejected existing identity: %v", err)
+	}
+
+	binding.Enabled = false
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("disabled binding error=%v, want ErrInvalidCredentials", err)
+	}
+
+	binding.Enabled = true
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err != nil {
+		t.Fatalf("re-enabled binding rejected existing identity: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE plugin_installations SET enabled = false WHERE id = $1`, f.installationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("disabled installation error=%v, want ErrInvalidCredentials", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE plugin_installations SET enabled = true WHERE id = $1`, f.installationID); err != nil {
+		t.Fatal(err)
+	}
+
+	binding.AutoProvision = false
+	if err := store.UpsertAuthBinding(ctx, *binding); err != nil {
+		t.Fatal(err)
+	}
+	unknown := f.response("entryUUID:auto-provision-disabled", "Unknown", f.prefix+"-unknown@example.test", "")
+	if _, err := provider.CompleteOAuth(ctx, unknown); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("disabled auto-provision error=%v, want ErrInvalidCredentials", err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err != nil {
+		t.Fatalf("disabled auto-provision rejected existing identity: %v", err)
+	}
+	var unknownUsers int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email = $1`, unknown.Email).Scan(&unknownUsers); err != nil {
+		t.Fatal(err)
+	}
+	if unknownUsers != 0 {
+		t.Fatalf("disabled auto-provision created %d users", unknownUsers)
+	}
+
+	if _, err := f.pool.Exec(ctx, `
+		DELETE FROM plugin_auth_bindings
+		WHERE plugin_installation_id = $1 AND capability_id = $2`, f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("deleted binding error=%v, want ErrInvalidCredentials", err)
+	}
+}
+
+func TestPluginAuthenticationBindingDisableSerializesWithLoginDB(t *testing.T) {
+	f := newPluginProviderDBFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	user, key := f.createIdentityUser(ctx, managedRoleUser, nil, nil, "entryUUID:concurrent-binding-disable")
+	provider := f.provider(false)
+
+	disable, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = disable.Rollback(context.Background()) }()
+	if _, err := disable.Exec(ctx, `
+		UPDATE plugin_auth_bindings
+		SET enabled = false
+		WHERE plugin_installation_id = $1 AND capability_id = $2`, f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, loginErr := provider.CompleteOAuth(ctx, f.response(key.ExternalSubject, user.Username, user.Email, ""))
+		result <- loginErr
+	}()
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting int
+		if err := f.pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND application_name = $1
+			  AND wait_event_type = 'Lock'
+			  AND query ILIKE '%FROM plugin_auth_bindings%'
+			  AND query ILIKE '%FOR SHARE%'`, f.prefix).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 1 {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("login did not wait for the concurrent binding disable")
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if err := disable.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("login after concurrent disable error=%v, want ErrInvalidCredentials", err)
+	}
+}
+
+func TestPluginManagedRoleAuthorityFollowsInstalledDescriptorWithoutReconstructionDB(t *testing.T) {
+	f := newPluginProviderDBFixture(t)
+	ctx := context.Background()
+	user, key := f.createIdentityUser(ctx, managedRoleUser, nil, nil, "entryUUID:dynamic-descriptor")
+	provider := f.provider(true)
+	response := f.response(key.ExternalSubject, user.Username, user.Email, managedRoleAdmin)
+	withoutRole := f.response(key.ExternalSubject, user.Username, user.Email, "")
+
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE plugin_capabilities
+		SET metadata = '{"auth_provider":{"managed_roles":{"supported_roles":["NOT_A_ROLE"]}}}'::jsonb
+		WHERE plugin_installation_id = $1 AND capability_type = 'auth_provider.v1' AND capability_id = $2`,
+		f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+	ordinary := f.response("entryUUID:malformed-descriptor-ordinary", "Ordinary", f.prefix+"-ordinary@example.test", "")
+	provisioned, err := provider.CompleteOAuth(ctx, ordinary)
+	if err != nil {
+		t.Fatalf("malformed managed-role descriptor blocked ordinary provisioning: %v", err)
+	}
+	if provisioned.Role != managedRoleUser {
+		t.Fatalf("ordinary provisioned role=%q, want user", provisioned.Role)
+	}
+	if _, err := provider.CompleteOAuth(ctx, withoutRole); err != nil {
+		t.Fatalf("malformed managed-role descriptor blocked ordinary authentication: %v", err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err == nil {
+		t.Fatal("malformed installed descriptor authorized a managed role")
+	}
+
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE plugin_capabilities
+		SET metadata = '{}'::jsonb
+		WHERE plugin_installation_id = $1 AND capability_type = 'auth_provider.v1' AND capability_id = $2`,
+		f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, response); err == nil {
+		t.Fatal("provider accepted a managed role after the installed descriptor was removed")
+	}
+	unchanged, err := NewUserRepository(f.pool).GetByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Role != managedRoleUser {
+		t.Fatalf("removed descriptor changed role to %q", unchanged.Role)
+	}
+	if _, err := f.pool.Exec(ctx, `
+		DELETE FROM plugin_capabilities
+		WHERE plugin_installation_id = $1 AND capability_type = 'auth_provider.v1' AND capability_id = $2`,
+		f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CompleteOAuth(ctx, withoutRole); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("removed auth capability error=%v, want ErrInvalidCredentials", err)
+	}
+
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO plugin_capabilities (plugin_installation_id, capability_type, capability_id, metadata)
+		VALUES ($1, 'auth_provider.v1', $2, '{"auth_provider":{"managed_roles":{"supported_roles":["MANAGED_SILO_ROLE_USER","MANAGED_SILO_ROLE_ADMIN"]}}}'::jsonb)`,
+		f.installationID, f.capabilityID); err != nil {
+		t.Fatal(err)
+	}
+	promoted, err := provider.CompleteOAuth(ctx, response)
+	if err != nil {
+		t.Fatalf("same provider did not observe added managed-role descriptor: %v", err)
+	}
+	if promoted.Role != managedRoleAdmin {
+		t.Fatalf("added descriptor role=%q, want admin", promoted.Role)
 	}
 }
 

@@ -174,7 +174,7 @@ jobs:
       - name: Test plugin identity and role transactions
         run: >-
           go test ./internal/auth
-          -run '^TestPlugin(ProvisioningConcurrentFirstLoginDB|ManagedRoleAuthorizationFollowsBindingWithoutReconstructionDB|ManagedRoleAuthorizationToggleConcurrentLoginDB|ManagedRoleSnapshotLifecycleDB|ManagedRoleSnapshotEdgeStatesDB|ManagedRoleDemotionWithoutSnapshotUsesFallbackDB|ManagedRoleDemotionWithoutSnapshotOrDefaultGroupDB|MalformedManagedRoleDoesNotModifyDB|CapabilityNamespacesDoNotRepointIdentityDB|ProvisioningDuplicatePolicyDB)$'
+          -run '^TestPlugin(ProvisioningConcurrentFirstLoginDB|AuthenticationFollowsBindingWithoutReconstructionDB|AuthenticationBindingDisableSerializesWithLoginDB|ManagedRoleAuthorityFollowsInstalledDescriptorWithoutReconstructionDB|ManagedRoleAuthorizationFollowsBindingWithoutReconstructionDB|ManagedRoleAuthorizationToggleConcurrentLoginDB|ManagedRoleSnapshotLifecycleDB|ManagedRoleSnapshotEdgeStatesDB|ManagedRoleDemotionWithoutSnapshotUsesFallbackDB|ManagedRoleDemotionWithoutSnapshotOrDefaultGroupDB|MalformedManagedRoleDoesNotModifyDB|CapabilityNamespacesDoNotRepointIdentityDB|ProvisioningDuplicatePolicyDB)$'
           -count=1 -v
 
       - name: Test native and compatibility session revocation

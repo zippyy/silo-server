@@ -361,35 +361,53 @@ func pluginConnectionCheckCapabilityForManifest(
 	manifest *pluginv1.PluginManifest,
 	configKey string,
 ) (pluginConnectionCheckCapability, error) {
-	if manifestHasAuthProvider(manifest) {
-		var selected *pluginConnectionCheckCapability
-		for _, descriptor := range manifest.GetCapabilities() {
-			if descriptor.GetType() != authProviderCapabilityType {
-				continue
+	var selected *pluginConnectionCheckCapability
+	for _, descriptor := range manifest.GetCapabilities() {
+		if descriptor.GetType() != authProviderCapabilityType {
+			continue
+		}
+		if metadata := descriptor.GetMetadata().AsMap(); metadata != nil {
+			if _, legacyTest := metadata["connection_test"]; legacyTest {
+				return malformedAuthConnectionCheck(configKey)
 			}
-			connectionTest := descriptor.GetAuthProvider().GetConnectionTest()
-			if connectionTest == nil || !containsString(connectionTest.GetConfigKeys(), configKey) {
-				continue
+			if _, legacyKeys := metadata["connection_test_config_keys"]; legacyKeys {
+				return malformedAuthConnectionCheck(configKey)
 			}
-			if selected != nil {
-				return pluginConnectionCheckCapability{}, &ConnectionTestError{
-					Message: fmt.Sprintf("Multiple authentication providers advertise connection checks for configuration key %q.", configKey),
-					Cause:   ErrConnectionTestUnsupported,
-				}
+		}
+		connectionTest := descriptor.GetAuthProvider().GetConnectionTest()
+		if connectionTest == nil {
+			continue
+		}
+		if descriptor.GetId() == "" || len(connectionTest.GetConfigKeys()) == 0 {
+			return malformedAuthConnectionCheck(configKey)
+		}
+		seenKeys := make(map[string]struct{}, len(connectionTest.GetConfigKeys()))
+		for _, key := range connectionTest.GetConfigKeys() {
+			if key == "" {
+				return malformedAuthConnectionCheck(configKey)
 			}
-			selected = &pluginConnectionCheckCapability{
-				kind:       connectionCheckKindAuth,
-				id:         descriptor.GetId(),
-				configKeys: append([]string(nil), connectionTest.GetConfigKeys()...),
+			if _, duplicate := seenKeys[key]; duplicate {
+				return malformedAuthConnectionCheck(configKey)
 			}
+			seenKeys[key] = struct{}{}
+		}
+		if !containsString(connectionTest.GetConfigKeys(), configKey) {
+			continue
 		}
 		if selected != nil {
-			return *selected, nil
+			return pluginConnectionCheckCapability{}, &ConnectionTestError{
+				Message: fmt.Sprintf("Multiple authentication providers advertise connection checks for configuration key %q.", configKey),
+				Cause:   ErrConnectionTestUnsupported,
+			}
 		}
-		return pluginConnectionCheckCapability{}, &ConnectionTestError{
-			Message: fmt.Sprintf("Authentication-provider connection checks are not supported for configuration key %q.", configKey),
-			Cause:   ErrConnectionTestUnsupported,
+		selected = &pluginConnectionCheckCapability{
+			kind:       connectionCheckKindAuth,
+			id:         descriptor.GetId(),
+			configKeys: append([]string(nil), connectionTest.GetConfigKeys()...),
 		}
+	}
+	if selected != nil {
+		return *selected, nil
 	}
 	if capabilityID, err := metadataProviderConnectionCheckCapabilityID(manifest); err == nil {
 		return pluginConnectionCheckCapability{
@@ -403,18 +421,16 @@ func pluginConnectionCheckCapabilityForManifest(
 	}
 }
 
+func malformedAuthConnectionCheck(configKey string) (pluginConnectionCheckCapability, error) {
+	return pluginConnectionCheckCapability{}, &ConnectionTestError{
+		Message: fmt.Sprintf("Authentication-provider connection-check metadata is invalid for configuration key %q.", configKey),
+		Cause:   ErrConnectionTestUnsupported,
+	}
+}
+
 func containsString(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {
-			return true
-		}
-	}
-	return false
-}
-
-func manifestHasAuthProvider(manifest *pluginv1.PluginManifest) bool {
-	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() == authProviderCapabilityType {
 			return true
 		}
 	}

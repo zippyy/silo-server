@@ -28,13 +28,6 @@ func TestPluginConnectionCheckRejectsUnadvertisedAuthProviderConfig(t *testing.T
 			},
 		},
 		{
-			name: "metadata provider is not an auth fallback",
-			capabilities: []*pluginv1.CapabilityDescriptor{
-				{Type: authProviderCapabilityType, Id: "ldap"},
-				{Type: "metadata_provider.v1", Id: "metadata"},
-			},
-		},
-		{
 			name: "legacy malformed advertisement stays unsupported",
 			capabilities: []*pluginv1.CapabilityDescriptor{
 				authCapabilityWithMetadata(t, map[string]any{
@@ -84,8 +77,12 @@ func TestPluginConnectionCheckSelectsTypedAuthProvider(t *testing.T) {
 		t.Fatalf("config keys = %#v, want [ldap tls]", capability.configKeys)
 	}
 
-	if _, err := pluginConnectionCheckCapabilityForManifest(manifest, "metadata"); !errors.Is(err, ErrConnectionTestUnsupported) {
-		t.Fatalf("unowned auth config selection error = %v, want unsupported", err)
+	metadataCapability, err := pluginConnectionCheckCapabilityForManifest(manifest, "metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadataCapability.kind != connectionCheckKindMetadata || metadataCapability.id != "metadata" {
+		t.Fatalf("unowned auth config selected %#v, want metadata provider", metadataCapability)
 	}
 }
 

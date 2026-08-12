@@ -12,7 +12,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"google.golang.org/protobuf/proto"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -34,10 +33,10 @@ type pluginAuthClient interface {
 
 type pluginAuthClientFactory func(ctx context.Context) (pluginAuthClient, error)
 
-// ManagedRoleBindingStore resolves the current operator authorization inside
-// the role-transition transaction.
-type ManagedRoleBindingStore interface {
-	GetAuthBindingTx(ctx context.Context, tx pgx.Tx, installationID int, capabilityID string) (*plugins.AuthBinding, error)
+// AuthProviderAuthorityStore resolves the persisted state used by each plugin
+// authentication decision.
+type AuthProviderAuthorityStore interface {
+	GetAuthProviderAuthorityTx(ctx context.Context, tx pgx.Tx, installationID int, capabilityID string) (*plugins.AuthProviderAuthority, error)
 }
 
 // UserSessionRevoker invalidates compatibility sessions after a committed
@@ -47,11 +46,11 @@ type UserSessionRevoker func(ctx context.Context, userID int) error
 // PluginProviderOption supplies runtime-owned authorization dependencies.
 type PluginProviderOption func(*PluginProvider)
 
-// WithManagedRoleBindingStore makes persisted auth-binding policy authoritative
-// for every managed-role authentication.
-func WithManagedRoleBindingStore(store ManagedRoleBindingStore) PluginProviderOption {
+// WithAuthProviderAuthorityStore makes persisted binding and capability state
+// authoritative for authentication decisions.
+func WithAuthProviderAuthorityStore(store AuthProviderAuthorityStore) PluginProviderOption {
 	return func(provider *PluginProvider) {
-		provider.managedRoleBindings = store
+		provider.authorityStore = store
 	}
 }
 
@@ -63,23 +62,19 @@ func WithUserSessionRevoker(revoker UserSessionRevoker) PluginProviderOption {
 }
 
 type PluginProviderConfig struct {
-	InstallationID                int
-	CapabilityID                  string
-	DisplayName                   string
-	AutoProvision                 bool
-	AdvertisedManagedRoles        *pluginv1.AuthProviderManagedRoleDescriptor
-	AdvertisedManagedRoleContract string
+	InstallationID int
+	CapabilityID   string
 }
 
 type PluginProvider struct {
-	config              PluginProviderConfig
-	client              pluginAuthClientFactory
-	sessions            *SessionRepository
-	users               *UserRepository
-	identities          *PluginIdentityRepository
-	accessGroups        *access.GroupStore
-	managedRoleBindings ManagedRoleBindingStore
-	compatSessions      UserSessionRevoker
+	config         PluginProviderConfig
+	client         pluginAuthClientFactory
+	sessions       *SessionRepository
+	users          *UserRepository
+	identities     *PluginIdentityRepository
+	accessGroups   *access.GroupStore
+	authorityStore AuthProviderAuthorityStore
+	compatSessions UserSessionRevoker
 }
 
 func NewPluginProviderWithClientFactory(
@@ -90,9 +85,6 @@ func NewPluginProviderWithClientFactory(
 	clientFactory pluginAuthClientFactory,
 	options ...PluginProviderOption,
 ) *PluginProvider {
-	if config.AdvertisedManagedRoles != nil {
-		config.AdvertisedManagedRoles = proto.CloneOf(config.AdvertisedManagedRoles)
-	}
 	provider := &PluginProvider{
 		config:       config,
 		client:       clientFactory,
@@ -125,6 +117,11 @@ func NewPluginProvider(
 }
 
 func (p *PluginProvider) Authenticate(ctx context.Context, creds Credentials) (*models.User, error) {
+	decision, authority, err := p.beginAuthDecision(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = decision.Rollback(ctx) }()
 	client, err := p.client(ctx)
 	if err != nil {
 		if errors.Is(err, ErrInvalidCredentials) || errors.Is(err, ErrUserDisabled) {
@@ -137,8 +134,9 @@ func (p *PluginProvider) Authenticate(ctx context.Context, creds Credentials) (*
 	}
 
 	response, err := client.Authenticate(ctx, &pluginv1.AuthenticateRequest{
-		Username: creds.Username,
-		Password: creds.Password,
+		Username:     creds.Username,
+		Password:     creds.Password,
+		CapabilityId: p.config.CapabilityID,
 	})
 	if err != nil {
 		if errors.Is(err, ErrInvalidCredentials) || errors.Is(err, ErrUserDisabled) {
@@ -146,17 +144,37 @@ func (p *PluginProvider) Authenticate(ctx context.Context, creds Credentials) (*
 		}
 		return nil, fmt.Errorf("plugin auth authenticate: %w", err)
 	}
-	return p.completeAuthentication(ctx, creds, response)
+	user, err := p.completeAuthentication(ctx, creds, response, authority.Binding)
+	if err != nil {
+		return nil, err
+	}
+	if err := decision.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit plugin auth decision: %w", err)
+	}
+	return user, nil
 }
 
 func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.AuthenticateResponse) (*models.User, error) {
-	return p.completeAuthentication(ctx, Credentials{}, response)
+	decision, authority, err := p.beginAuthDecision(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = decision.Rollback(ctx) }()
+	user, err := p.completeAuthentication(ctx, Credentials{}, response, authority.Binding)
+	if err != nil {
+		return nil, err
+	}
+	if err := decision.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit plugin OAuth decision: %w", err)
+	}
+	return user, nil
 }
 
 func (p *PluginProvider) completeAuthentication(
 	ctx context.Context,
 	creds Credentials,
 	response *pluginv1.AuthenticateResponse,
+	binding *plugins.AuthBinding,
 ) (*models.User, error) {
 	if response.GetExternalSubject() == "" {
 		return nil, ErrInvalidCredentials
@@ -172,10 +190,46 @@ func (p *PluginProvider) completeAuthentication(
 	if !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
-	if !p.config.AutoProvision {
+	if !binding.AutoProvision {
 		return nil, ErrInvalidCredentials
 	}
 	return p.autoProvisionUser(ctx, key, creds, response)
+}
+
+func (p *PluginProvider) beginAuthDecision(ctx context.Context) (pgx.Tx, *plugins.AuthProviderAuthority, error) {
+	if p.authorityStore == nil {
+		return nil, nil, fmt.Errorf("plugin auth authority store is unavailable")
+	}
+	tx, err := p.identities.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin plugin auth decision: %w", err)
+	}
+	authority, err := p.authorityStore.GetAuthProviderAuthorityTx(
+		ctx, tx, p.config.InstallationID, p.config.CapabilityID,
+	)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		if errors.Is(err, plugins.ErrAuthBindingNotFound) || errors.Is(err, plugins.ErrInstallationNotFound) {
+			return nil, nil, ErrInvalidCredentials
+		}
+		return nil, nil, fmt.Errorf("load plugin auth authority: %w", err)
+	}
+	if !authority.InstallationEnabled || !authority.Binding.Enabled {
+		_ = tx.Rollback(ctx)
+		return nil, nil, ErrInvalidCredentials
+	}
+	return tx, authority, nil
+}
+
+func (p *PluginProvider) verifyCurrentAuthority(ctx context.Context) error {
+	tx, _, err := p.beginAuthDecision(ctx)
+	if err != nil {
+		return err
+	}
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return fmt.Errorf("finish plugin auth authority check: %w", err)
+	}
+	return nil
 }
 
 func (p *PluginProvider) InstallationID() int { return p.config.InstallationID }
@@ -183,6 +237,9 @@ func (p *PluginProvider) InstallationID() int { return p.config.InstallationID }
 func (p *PluginProvider) CapabilityID() string { return p.config.CapabilityID }
 
 func (p *PluginProvider) OAuthClient(ctx context.Context) (OAuthClient, error) {
+	if err := p.verifyCurrentAuthority(ctx); err != nil {
+		return nil, err
+	}
 	c, err := p.client(ctx)
 	if err != nil {
 		return nil, err
@@ -193,6 +250,12 @@ func (p *PluginProvider) OAuthClient(ctx context.Context) (OAuthClient, error) {
 func (p *PluginProvider) ValidateSession(ctx context.Context, sessionID string) (bool, error) {
 	if p.sessions == nil {
 		return false, nil
+	}
+	if err := p.verifyCurrentAuthority(ctx); err != nil {
+		if errors.Is(err, ErrInvalidCredentials) {
+			return false, nil
+		}
+		return false, err
 	}
 	if _, err := p.client(ctx); err != nil {
 		if errors.Is(err, plugins.ErrInstallationDisabled) {
@@ -245,9 +308,17 @@ func (p *PluginProvider) autoProvisionUser(
 		return nil, fmt.Errorf("begin plugin user provisioning: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	desiredRole, roleManaged, err := p.managedRoleFromResponseTx(ctx, tx, response)
+	desiredRole := managedRoleUser
+	roleManaged, err := managedRoleRequested(response)
 	if err != nil {
 		return nil, err
+	}
+	roleContract := ""
+	if roleManaged {
+		desiredRole, roleManaged, roleContract, err = p.managedRoleFromResponseTx(ctx, tx, response)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if existing, getErr := p.identities.GetTx(ctx, tx, key, false); getErr == nil {
@@ -321,6 +392,7 @@ func (p *PluginProvider) autoProvisionUser(
 		if err != nil {
 			return nil, err
 		}
+		transition.contract = roleContract
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit plugin user provisioning: %w", err)
@@ -387,7 +459,7 @@ func (p *PluginProvider) synchronizeManagedRole(
 		return nil, fmt.Errorf("begin managed-role synchronization: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	desiredRole, managed, err := p.managedRoleFromResponseTx(ctx, tx, response)
+	desiredRole, managed, roleContract, err := p.managedRoleFromResponseTx(ctx, tx, response)
 	if err != nil {
 		return nil, err
 	}
@@ -409,6 +481,7 @@ func (p *PluginProvider) synchronizeManagedRole(
 	if err != nil {
 		return nil, err
 	}
+	transition.contract = roleContract
 	if !transition.changed {
 		return current, nil
 	}
@@ -423,33 +496,61 @@ func (p *PluginProvider) managedRoleFromResponseTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	response *pluginv1.AuthenticateResponse,
-) (string, bool, error) {
-	operatorAuthorized := false
-	hasAdvertisement := p.config.AdvertisedManagedRoles != nil ||
-		p.config.AdvertisedManagedRoleContract == ManagedRoleContractV1
-	if hasAdvertisement && p.managedRoleBindings != nil {
-		binding, err := p.managedRoleBindings.GetAuthBindingTx(
-			ctx, tx, p.config.InstallationID, p.config.CapabilityID,
-		)
-		if err != nil {
-			if !errors.Is(err, plugins.ErrAuthBindingNotFound) {
-				return "", false, fmt.Errorf("load managed-role authorization: %w", err)
-			}
-		} else if binding.Enabled && binding.ManagedRolesEnabled {
-			operatorAuthorized = true
-		}
+) (string, bool, string, error) {
+	if p.authorityStore == nil {
+		return "", false, "", fmt.Errorf("plugin auth authority store is unavailable")
 	}
-	return managedRoleFromResponse(
+	authority, err := p.authorityStore.GetAuthProviderAuthorityTx(
+		ctx, tx, p.config.InstallationID, p.config.CapabilityID,
+	)
+	if err != nil {
+		if errors.Is(err, plugins.ErrAuthBindingNotFound) || errors.Is(err, plugins.ErrInstallationNotFound) {
+			return "", false, "", fmt.Errorf("plugin is not authorized for managed roles")
+		}
+		return "", false, "", fmt.Errorf("load managed-role authorization: %w", err)
+	}
+	descriptor, descriptorErr := plugins.DecodeCapability(&plugins.Capability{
+		InstallationID: p.config.InstallationID,
+		Type:           "auth_provider.v1",
+		ID:             p.config.CapabilityID,
+		Metadata:       authority.CapabilityMetadata,
+	})
+	if descriptorErr != nil {
+		return "", false, "", fmt.Errorf("installed managed-role advertisement: %w", descriptorErr)
+	}
+	managedRoles, descriptorErr := ManagedRoleDescriptorFromCapability(descriptor)
+	if descriptorErr != nil {
+		return "", false, "", fmt.Errorf("installed managed-role advertisement: %w", descriptorErr)
+	}
+	legacyMetadata := map[string]any{}
+	if descriptor.GetMetadata() != nil {
+		legacyMetadata = descriptor.GetMetadata().AsMap()
+	}
+	legacyContract, descriptorErr := ManagedRoleContractFromMetadata(legacyMetadata)
+	if descriptorErr != nil {
+		return "", false, "", fmt.Errorf("installed managed-role advertisement: %w", descriptorErr)
+	}
+	operatorAuthorized := authority.InstallationEnabled && authority.Binding.Enabled &&
+		authority.Binding.ManagedRolesEnabled
+	role, managed, err := managedRoleFromResponse(
 		response,
-		p.config.AdvertisedManagedRoles,
-		p.config.AdvertisedManagedRoleContract,
+		managedRoles,
+		legacyContract,
 		operatorAuthorized,
 	)
+	if err != nil || !managed {
+		return role, managed, "", err
+	}
+	if response.GetManagedSiloRole() != nil {
+		return role, true, ManagedRoleContractSDK, nil
+	}
+	return role, true, legacyContract, nil
 }
 
 type roleTransition struct {
 	previous string
 	next     string
+	contract string
 	changed  bool
 }
 
@@ -561,15 +662,8 @@ func (p *PluginProvider) logRoleTransition(ctx context.Context, userID int, tran
 		"user_id", userID,
 		"previous_role", transition.previous,
 		"new_role", transition.next,
-		"contract", p.managedRoleContractName(),
+		"contract", transition.contract,
 	)
-}
-
-func (p *PluginProvider) managedRoleContractName() string {
-	if p.config.AdvertisedManagedRoles != nil {
-		return ManagedRoleContractSDK
-	}
-	return p.config.AdvertisedManagedRoleContract
 }
 
 func provisionedUsernameBase(response *pluginv1.AuthenticateResponse, creds Credentials, installationID int) string {
