@@ -123,7 +123,7 @@ func authProviderConnectionTestEntries(
 	ownedEntries := make([]*pluginv1.ConfigEntry, 0, len(configKeys))
 	for _, key := range configKeys {
 		if entry := entriesByKey[key]; entry != nil {
-			ownedEntries = append(ownedEntries, proto.Clone(entry).(*pluginv1.ConfigEntry))
+			ownedEntries = append(ownedEntries, proto.CloneOf(entry))
 			continue
 		}
 		ownedEntries = append(ownedEntries, &pluginv1.ConfigEntry{

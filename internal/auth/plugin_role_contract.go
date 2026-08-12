@@ -46,7 +46,7 @@ func ManagedRoleDescriptorFromCapability(
 		}
 		seen[role] = struct{}{}
 	}
-	return proto.Clone(managedRoles).(*pluginv1.AuthProviderManagedRoleDescriptor), nil
+	return proto.CloneOf(managedRoles), nil
 }
 
 func ManagedRoleContractFromMetadata(metadata map[string]any) (string, error) {

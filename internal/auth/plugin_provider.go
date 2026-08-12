@@ -91,7 +91,7 @@ func NewPluginProviderWithClientFactory(
 	options ...PluginProviderOption,
 ) *PluginProvider {
 	if config.AdvertisedManagedRoles != nil {
-		config.AdvertisedManagedRoles = proto.Clone(config.AdvertisedManagedRoles).(*pluginv1.AuthProviderManagedRoleDescriptor)
+		config.AdvertisedManagedRoles = proto.CloneOf(config.AdvertisedManagedRoles)
 	}
 	provider := &PluginProvider{
 		config:       config,
