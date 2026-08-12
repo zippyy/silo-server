@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Plan is the result of a node selection for one playback session.
@@ -18,6 +20,22 @@ type Plan struct {
 // without a real pool.
 type SessionPlanner interface {
 	PlanSession(sessionID, currentTranscodeURL string, needsTranscode bool, estBitrateKbps int) Plan
+}
+
+// DownloadPlanner selects proxy nodes for unbounded file delivery. Downloads
+// have no predictable bitrate, so implementations must not admit them onto a
+// proxy with a configured bandwidth cap.
+type DownloadPlanner interface {
+	PlanDownload(sessionID string, preferredGroup ...string) Plan
+	ReleaseSession(sessionID string)
+}
+
+// TranscodeWorkPlanner reserves capacity for non-streaming GPU work such as a
+// prepared download. The returned release function must be called after the
+// remote operation ends or falls back locally.
+type TranscodeWorkPlanner interface {
+	ReserveTranscodeWork(workID string) (*Node, func())
+	TranscodeNode(nodeID int) (*Node, bool)
 }
 
 // reservation bridges the gap between assigning a session to a node and the
@@ -89,6 +107,65 @@ func NewPlanner(proxies *ProxyPool, transcodes *TranscodePool) *Planner {
 // reservation, so quality switches don't double-count.
 func (p *Planner) PlanSession(sessionID, currentTranscodeURL string, needsTranscode bool, estBitrateKbps int) Plan {
 	return p.PlanSessionWith(sessionID, currentTranscodeURL, needsTranscode, estBitrateKbps, nil)
+}
+
+// TranscodeNode returns the current pool record for a persistent node id. It
+// lets durable artifact locators follow an administrator-edited node URL/group.
+func (p *Planner) TranscodeNode(nodeID int) (*Node, bool) {
+	if p == nil || p.transcodes == nil || nodeID == 0 {
+		return nil, false
+	}
+	for _, node := range p.transcodes.Nodes() {
+		if node != nil && node.ID == nodeID && node.Enabled {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+// PlanDownload picks a healthy proxy for an unbounded file transfer. A
+// configured proxy bandwidth cap cannot be reserved accurately without a known
+// transfer rate, so capped proxies are excluded instead of being oversubscribed
+// during the egress meter's convergence window.
+func (p *Planner) PlanDownload(sessionID string, preferredGroup ...string) Plan {
+	if p == nil || p.proxies == nil || sessionID == "" {
+		return Plan{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := p.now()
+	p.pruneReservations(now)
+	delete(p.reserved, sessionID)
+
+	group := ""
+	if len(preferredGroup) > 0 {
+		group = preferredGroup[0]
+	}
+	var candidates, fallback []*Node
+	for _, node := range p.proxies.Nodes() {
+		if node == nil || !node.Enabled || !node.Healthy || !p.underCap(node, now) {
+			continue
+		}
+		if node.MaxBandwidthKbps != nil && *node.MaxBandwidthKbps > 0 {
+			continue
+		}
+		fallback = append(fallback, node)
+		if group != "" && node.Group != nil && *node.Group == group {
+			candidates = append(candidates, node)
+		}
+	}
+	if group == "" || len(candidates) == 0 {
+		candidates = fallback
+	}
+	if len(candidates) == 0 {
+		return Plan{}
+	}
+	rrKey := "download:" + group
+	proxy := candidates[p.rr[rrKey]%len(candidates)]
+	p.rr[rrKey]++
+	p.reserved[sessionID] = &reservation{proxyURL: proxy.URL, createdAt: now}
+	return Plan{ProxyNode: proxy}
 }
 
 // PlanSessionWith behaves like PlanSession but restricts transcode-node
@@ -178,6 +255,42 @@ func (p *Planner) ReleaseSession(sessionID string) {
 	p.mu.Lock()
 	delete(p.reserved, sessionID)
 	p.mu.Unlock()
+}
+
+// ReserveTranscodeWork selects the least-loaded healthy transcode node while
+// sharing the same health-bridging reservation accounting as playback. Unlike
+// a playback session it does not require a proxy partner: the completed file
+// is written to the configured shared artifact store and served later.
+func (p *Planner) ReserveTranscodeWork(workID string) (*Node, func()) {
+	if p == nil || p.transcodes == nil || workID == "" {
+		return nil, func() {}
+	}
+	p.mu.Lock()
+	now := p.now()
+	p.pruneReservations(now)
+	reservationID := workID + "-" + uuid.NewString()
+
+	var best *Node
+	for _, node := range p.transcodes.Nodes() {
+		if node == nil || !node.Enabled || !node.Healthy || !p.underCap(node, now) {
+			continue
+		}
+		if best == nil || p.effectiveJobs(node, now) < p.effectiveJobs(best, now) {
+			best = node
+		}
+	}
+	if best != nil {
+		p.reserved[reservationID] = &reservation{transcodeURL: best.URL, createdAt: now}
+	}
+	p.mu.Unlock()
+	if best == nil {
+		return nil, func() {}
+	}
+
+	var once sync.Once
+	return best, func() {
+		once.Do(func() { p.ReleaseSession(reservationID) })
+	}
 }
 
 // groupHealth reports, for every group label present in either pool, whether

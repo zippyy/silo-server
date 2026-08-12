@@ -67,13 +67,14 @@ export function deliveryClassV3(delivery: DeliveryV3): DeliveryClassV3 {
  */
 export type CapabilityEvidenceV3 = "exact" | "platform_attested" | "declared";
 
-/** Which of the five replan intents a replan request expresses. */
+/** Which replan intent a replan request expresses. */
 export type ReplanOperationV3 =
   | "failure_recovery"
   | "seek_reanchor"
   | "seek_failure_recovery"
   | "track_change"
-  | "quality_change";
+  | "quality_change"
+  | "output_change";
 
 /** Transport protocol of a plan's stream URL. */
 export type StreamProtocolV3 = "http_progressive" | "hls";
@@ -122,6 +123,9 @@ export const FEATURE_PLAYBACK_PLAN_V3 = "playback_plan_v3";
 /** Server-minted attempt keys and intent replans from the neutral v3 contract. */
 export const FEATURE_NEUTRAL_PLAYBACK_V3_CONTRACT = "neutral_playback_v3_contract_v1";
 
+/** Server accepts output-capability refreshes without treating the route as failed. */
+export const FEATURE_OUTPUT_CHANGE_V3 = "output_change_v1";
+
 /** The `original` rung label, which always preserves the source. */
 export const QUALITY_ORIGINAL_V3 = "original";
 
@@ -138,7 +142,16 @@ export interface HDRCapabilitiesV3 {
   hdr10: boolean;
   hdr10_plus: boolean;
   hlg: boolean;
+  hdr10_max_width?: number;
+  hdr10_max_height?: number;
+  hdr10_max_frame_rate?: number;
+  hdr10_max_bitrate_kbps?: number;
   dolby_vision_profiles: number[];
+  dolby_vision_profile_levels?: Array<{
+    profile: number;
+    max_level: number;
+    bl_compatibility_ids?: number[];
+  }>;
 }
 
 export interface AudioPassthroughEntryV3 {
@@ -388,6 +401,7 @@ export interface SourceDescriptorV3 {
   dynamic_range?: string;
   hdr10_plus: boolean;
   dolby_vision_profile?: number;
+  dolby_vision_level?: number;
   dv_bl_compat_id?: number;
   dv_enhancement_layer: EnhancementLayerV3;
   audio_codec?: string;

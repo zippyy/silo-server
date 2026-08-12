@@ -121,6 +121,7 @@ var (
 		string(playback.ReplanOperationSeekFailureRecoveryV3),
 		string(playback.ReplanOperationTrackChangeV3),
 		string(playback.ReplanOperationQualityChangeV3),
+		string(playback.ReplanOperationOutputChangeV3),
 	}
 	// The two operations ReplanRequestV3.Validate rejects without a failure
 	// classification. The schema expresses the same rule as a conditional.
@@ -157,6 +158,25 @@ func TestClientProgressPersistenceRequiresExplicitStartPosition(t *testing.T) {
 	delete(request, "start_position")
 	if err := schemas["start-request.schema.json"].Validate(request); err == nil {
 		t.Fatal("client progress_persistence without start_position satisfied the schema")
+	}
+}
+
+func TestIntentOnlyReplansRejectFailureEvidence(t *testing.T) {
+	schemas := compileSchemasV3(t)
+	for _, operation := range []playback.ReplanOperationV3{
+		playback.ReplanOperationTrackChangeV3,
+		playback.ReplanOperationQualityChangeV3,
+		playback.ReplanOperationOutputChangeV3,
+	} {
+		t.Run(string(operation), func(t *testing.T) {
+			request := decodeJSONValue(t, mustReadFile(t, filepath.Join(goldenRootV3, "replan_request.json"))).(map[string]any)
+			request["operation"] = string(operation)
+			request["quality_preference"] = "720p"
+			request["failure"] = map[string]any{"classification": "decoder_failure"}
+			if err := schemas["replan-request.schema.json"].Validate(request); err == nil {
+				t.Fatal("intent-only replan with failure satisfied the schema")
+			}
+		})
 	}
 }
 
@@ -213,7 +233,7 @@ func TestConformanceMatrixEmbeddedWireBodiesSatisfySchemas(t *testing.T) {
 		request := scenario["request"].(map[string]any)
 		validate(name, "replan-request.schema.json", request)
 		switch request["operation"] {
-		case string(playback.ReplanOperationTrackChangeV3), string(playback.ReplanOperationQualityChangeV3), string(playback.ReplanOperationSeekReanchorV3):
+		case string(playback.ReplanOperationTrackChangeV3), string(playback.ReplanOperationQualityChangeV3), string(playback.ReplanOperationOutputChangeV3), string(playback.ReplanOperationSeekReanchorV3):
 			if failure, ok := request["failure"]; ok {
 				t.Errorf("scenario %q intent-only replan carries failure = %#v", name, failure)
 			}

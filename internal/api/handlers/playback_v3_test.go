@@ -116,6 +116,17 @@ func TestShouldTryAlternateFileV3PinsOriginalQuality(t *testing.T) {
 	}
 }
 
+func TestTerminalAllowsAlternateFileV3IncludesHDRIncompatibility(t *testing.T) {
+	for _, reason := range []string{"no_alternate_version", "hdr_transcode_unsupported"} {
+		if !terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: reason}) {
+			t.Fatalf("terminal reason %q should permit alternate selection", reason)
+		}
+	}
+	if terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: "client_hls_unsupported"}) {
+		t.Fatal("unrelated terminal reason should not permit alternate selection")
+	}
+}
+
 func TestValidateAdvertisedTransformationsV3RejectsOldVideoRecipe(t *testing.T) {
 	plan := &playback.PlanV3{Transformations: []playback.TransformationV3{{
 		Name:          playback.TransformationVideoToH264V3,
@@ -195,6 +206,53 @@ func TestHandleStartPlaybackV3ExplainsOriginalQuality4KPinWhenAlternateExists(t 
 	}
 }
 
+func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVIWithHDR10", DVProfile: 8, DVBLCompatID: 1,
+	}
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.CodecVideo = "h264"
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: source})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("effective file = %d, want alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+}
+
 func TestReplanAllowsAlternateFileV3PinsSeekOperations(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -203,6 +261,8 @@ func TestReplanAllowsAlternateFileV3PinsSeekOperations(t *testing.T) {
 		want      bool
 	}{
 		{name: "ordinary failure may use another version", operation: playback.ReplanOperationFailureRecoveryV3, quality: "auto", want: true},
+		{name: "output change may use another version", operation: playback.ReplanOperationOutputChangeV3, quality: "auto", want: true},
+		{name: "track change may use another version", operation: playback.ReplanOperationTrackChangeV3, quality: "auto", want: true},
 		{name: "original quality remains pinned", operation: playback.ReplanOperationFailureRecoveryV3, quality: "original", want: false},
 		{name: "exact seek reanchor pins current version", operation: playback.ReplanOperationSeekReanchorV3, quality: "auto", want: false},
 		{name: "failed seek recovery pins current version", operation: playback.ReplanOperationSeekFailureRecoveryV3, quality: "auto", want: false},
@@ -1679,10 +1739,10 @@ func TestHandleReplanPlaybackV3SeekUsesEffectiveEditionWhenRequestedEditionIsGon
 		t.Fatal(err)
 	}
 	outputContext := current.NormalizedRequest.ClientPlaybackContext
-	outputContext.Output.OutputContextID = "route-2"
 	currentKey = playback.PlanAttemptKeyV3(current.CurrentPlan, current.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 	ordinary := playback.ReplanRequestV3{
 		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationOutputChangeV3,
 		PlaybackAttemptID:     current.PlaybackAttemptID,
 		ReplanRequestID:       "ordinary-missing-requested-0001",
 		FailedPlanID:          current.CurrentPlanID,
@@ -1693,7 +1753,7 @@ func TestHandleReplanPlaybackV3SeekUsesEffectiveEditionWhenRequestedEditionIsGon
 		QualityPreference:     current.NormalizedRequest.QualityPreference,
 		PositionSeconds:       320,
 		SelectedTracks:        current.CurrentPlan.SelectedTracks,
-		Failure:               playback.FailureV3{Classification: "output_route_changed"},
+		Failure:               playback.FailureV3{},
 		Capabilities:          current.NormalizedRequest.Capabilities,
 		ClientPlaybackContext: outputContext,
 	}
@@ -2843,6 +2903,108 @@ func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsUnavailableInFa
 	}
 }
 
+func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Container = "mkv"
+	source.FilePath = writePlaybackTestMediaFile(t, "movie-4k.mkv")
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.Bitrate = 64_000
+	source.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Profile: "main 10", Level: 153, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 64_000, BitDepth: 10,
+		VideoRange: "HDR10", VideoRangeType: "HDR10",
+	}}
+	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
+
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.FilePath = writePlaybackTestMediaFile(t, "movie-1080p.mkv")
+	alternate.CodecVideo = "h264"
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
+		VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "true", "allow_4k_transcode": "true"}}
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: "1", Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: "2", Available: true},
+	}))
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.Capabilities.CodecsVideo = []string{"hevc", "h264"}
+	startRequest.Capabilities.CodecsVideoHardware = []string{"hevc", "h264"}
+	startRequest.Capabilities.Containers = []string{"mkv", "hls"}
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode = []playback.VideoDecodeCapabilityV3{{
+		Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10},
+		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true,
+	}}
+	hdr := &playback.HDRCapabilitiesV3{HDR10: true}
+	startRequest.Capabilities.HDRDetails = hdr
+	startRequest.ClientPlaybackContext.Output.HDRDetails = hdr
+	startRequest.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassOriginalHTTPV3: {
+			Enabled: true, SupportedOnDevice: true, Containers: []string{"mkv"},
+			VideoCodecs: []string{"hevc", "h264"}, AudioDecodeCodecs: []string{"aac"},
+		},
+		playback.DeliveryClassHLSV3: {
+			Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+			VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+		},
+	}
+
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	if started.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("start effective file = %d, want HDR source %d", started.PlaybackPlan.EffectiveMediaFileID, source.ID)
+	}
+
+	subtitleIndex := 0
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "hdr-subtitle-fallback-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "hdr-subtitle-attempt-0001",
+		PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey, AttemptCount: 1, PositionSeconds: 30,
+		QualityPreference: "auto",
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio: started.PlaybackPlan.SelectedTracks.Audio,
+			Subtitle: &playback.TrackIdentityV3{
+				ID: playback.TrackIDV3(source.ID, "subtitle", subtitleIndex), Index: &subtitleIndex,
+			},
+		},
+		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.PlaybackPlan == nil || replanned.Terminal != nil {
+		t.Fatalf("subtitle replan = %#v", replanned)
+	}
+	if replanned.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("subtitle effective file = %d, want SDR alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+	if replanned.PlaybackPlan.Subtitle.Mode != playback.SubtitleBurnInV3 || replanned.PlaybackPlan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("subtitle plan = %#v, want burn-in selection", replanned.PlaybackPlan)
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
+}
+
 func TestHandleReplanPlaybackV3TrackChangeStaysOnEffectiveAlternate(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.Resolution = "2160p"
@@ -2857,6 +3019,7 @@ func TestHandleReplanPlaybackV3TrackChangeStaysOnEffectiveAlternate(t *testing.T
 	alternate.VideoTracks[0].Level, alternate.VideoTracks[0].Bitrate = 41, 8_000
 	alternate.AudioTracks = append([]models.AudioTrack(nil), source.AudioTracks...)
 	alternate.AudioTracks = append(alternate.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "spa"})
+	alternate.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "alternate.eng.ass"), Language: "eng", Format: "ass"}}
 
 	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
 	manager := playback.NewSessionManager(0, 0)
@@ -2889,6 +3052,111 @@ func TestHandleReplanPlaybackV3TrackChangeStaysOnEffectiveAlternate(t *testing.T
 	}
 	if response.PlaybackPlan.SelectedTracks.Audio == nil || response.PlaybackPlan.SelectedTracks.Audio.Index == nil || *response.PlaybackPlan.SelectedTracks.Audio.Index != audioIndex {
 		t.Fatalf("alternate audio selection = %#v", response.PlaybackPlan.SelectedTracks.Audio)
+	}
+
+	subtitleIndex := 0
+	withSubtitle := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "alternate-subtitle-change-0001",
+		FailedPlanID: response.PlaybackPlan.PlanID, PlanAttemptID: "alternate-subtitle-attempt-0001",
+		PlanAttemptKey: response.PlaybackPlan.PlanAttemptKey, AttemptCount: 1, PositionSeconds: 31,
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio:    response.PlaybackPlan.SelectedTracks.Audio,
+			Subtitle: &playback.TrackIdentityV3{Index: &subtitleIndex},
+		},
+		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if withSubtitle.PlaybackPlan == nil || withSubtitle.PlaybackPlan.EffectiveMediaFileID != alternate.ID || withSubtitle.PlaybackPlan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("alternate subtitle selection failed: %#v", withSubtitle)
+	}
+
+	upgradedCapabilities := startRequest.Capabilities
+	upgradedCapabilities.MaxResolution = "2160p"
+	upgradedCapabilities.VideoDecode = append([]playback.VideoDecodeCapabilityV3(nil), startRequest.Capabilities.VideoDecode...)
+	upgradedCapabilities.VideoDecode[0].Levels = []int{51}
+	upgradedCapabilities.VideoDecode[0].MaxWidth = 3840
+	upgradedCapabilities.VideoDecode[0].MaxHeight = 2160
+	upgradedCapabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	outputResponse := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationOutputChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "alternate-output-change-0001",
+		FailedPlanID: withSubtitle.PlaybackPlan.PlanID, PlanAttemptID: "alternate-output-attempt-0001",
+		PlanAttemptKey: withSubtitle.PlaybackPlan.PlanAttemptKey, AttemptCount: 1, PositionSeconds: 32,
+		SelectedTracks:        withSubtitle.PlaybackPlan.SelectedTracks,
+		Capabilities:          upgradedCapabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if outputResponse.PlaybackPlan == nil || outputResponse.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("output change abandoned alternate-only subtitle: %#v", outputResponse)
+	}
+	if outputResponse.PlaybackPlan.SelectedTracks.Subtitle == nil || !strings.HasPrefix(outputResponse.PlaybackPlan.SelectedTracks.Subtitle.ID, "file:84:subtitle:") {
+		t.Fatalf("output change lost alternate subtitle: %#v", outputResponse.PlaybackPlan.SelectedTracks.Subtitle)
+	}
+}
+
+func TestHandleReplanPlaybackV3OutputChangeRetriesActiveAlternateAfterRequestedTerminal(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Resolution, source.Bitrate = "2160p", 32_000
+	source.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	source.VideoTracks[0].Width, source.VideoTracks[0].Height = 3840, 2160
+	source.VideoTracks[0].Level, source.VideoTracks[0].Bitrate = 51, 32_000
+
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID, alternate.Container, alternate.Resolution, alternate.Bitrate = 84, "mp4", "1080p", 8_000
+	alternate.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	alternate.VideoTracks[0].Width, alternate.VideoTracks[0].Height = 1920, 1080
+	alternate.VideoTracks[0].Level, alternate.VideoTracks[0].Bitrate = 41, 8_000
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate}}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("alternate start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	// The inactive requested edition can acquire a different constraint before
+	// an output refresh (for example after a rescan). Its speculative terminal
+	// must not displace the already-playing alternate.
+	source.Container = "mkv"
+	source.CodecVideo = "av1"
+	source.VideoTracks[0].Codec = "av1"
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false", "allow_4k_transcode": "false"}}
+
+	upgradedCapabilities := startRequest.Capabilities
+	upgradedCapabilities.MaxResolution = "2160p"
+	upgradedCapabilities.VideoDecode = append([]playback.VideoDecodeCapabilityV3(nil), startRequest.Capabilities.VideoDecode...)
+	upgradedCapabilities.VideoDecode[0].Levels = []int{51}
+	upgradedCapabilities.VideoDecode[0].MaxWidth = 3840
+	upgradedCapabilities.VideoDecode[0].MaxHeight = 2160
+	upgradedCapabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationOutputChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "alternate-terminal-output-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "alternate-terminal-attempt-0001",
+		PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey, AttemptCount: 1, PositionSeconds: 33,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          upgradedCapabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil || response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("requested-edition terminal abandoned active alternate: %#v", response)
 	}
 }
 

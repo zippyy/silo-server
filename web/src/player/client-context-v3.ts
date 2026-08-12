@@ -19,6 +19,7 @@ import {
   type DeliveryCapabilityV3,
   type DeliveryClassV3,
   type DeliverySubtitleCapabilitiesV3,
+  type HDRCapabilitiesV3,
 } from "./protocol-v3";
 
 /** App version reported to the server for diagnostics. */
@@ -65,12 +66,16 @@ export interface WebCapabilityProbe {
   containers: string[];
   /** Video codec names the browser reported support for. */
   codecsVideo: string[];
+  /** Video codecs supported specifically by direct media-element playback. */
+  progressiveCodecsVideo: string[];
   /** Audio codec names the browser reported support for. */
   codecsAudio: string[];
   /** Best-effort screen-derived resolution ceiling. */
   maxResolution: string;
   /** Best-effort HDR display detection. */
   hdr: boolean;
+  /** Structured HDR formats supported by the active browser output path. */
+  hdrDetails: HDRCapabilitiesV3;
   /** Whether hls.js can be used on this browser. */
   hls: boolean;
 }
@@ -82,15 +87,17 @@ export interface WebCapabilityProbe {
  * server treats the two lists identically.
  */
 export function buildClientCapabilitiesV3(probe: WebCapabilityProbe): ClientCodecCapabilitiesV3 {
+  const codecsVideo = Array.from(new Set([...probe.codecsVideo, ...probe.progressiveCodecsVideo]));
   return {
     video_evidence: "declared",
     audio_evidence: "declared",
-    codecs_video: probe.codecsVideo,
-    codecs_video_hardware: probe.codecsVideo,
+    codecs_video: codecsVideo,
+    codecs_video_hardware: codecsVideo,
     codecs_audio: probe.codecsAudio,
     containers: probe.containers,
     max_resolution: probe.maxResolution,
     hdr: probe.hdr,
+    hdr_details: probe.hdrDetails,
   };
 }
 
@@ -107,6 +114,7 @@ function buildDeliveryCapability(
     // A browser cannot bitstream audio to a receiver, and passthrough claims
     // are only ever honoured under the `exact` tier anyway.
     audio_passthrough_codecs: [],
+    hdr_details: probe.hdrDetails,
     subtitles: WEB_SUBTITLE_CAPABILITIES,
     features: [],
     // The stream URL carries its own token; the player reloads the source
@@ -126,13 +134,31 @@ function buildDeliveryCapability(
 export function buildDeliveriesV3(
   probe: WebCapabilityProbe,
 ): Partial<Record<DeliveryClassV3, DeliveryCapabilityV3>> {
+  const nonProgressiveHDRDetails: HDRCapabilitiesV3 = {
+    ...probe.hdrDetails,
+    // The Dolby Vision and HDR10 probes cover direct progressive playback
+    // through the media element after Silo normalizes the sample entry. They
+    // say nothing about an untouched original or hls.js' MediaSource path.
+    hdr10: false,
+    dolby_vision_profiles: [],
+    dolby_vision_profile_levels: [],
+  };
+  delete nonProgressiveHDRDetails.hdr10_max_width;
+  delete nonProgressiveHDRDetails.hdr10_max_height;
+  delete nonProgressiveHDRDetails.hdr10_max_frame_rate;
+  delete nonProgressiveHDRDetails.hdr10_max_bitrate_kbps;
   return {
-    original_http: buildDeliveryCapability(probe, {}),
-    progressive: buildDeliveryCapability(probe, {}),
+    original_http: buildDeliveryCapability(probe, {
+      hdr_details: nonProgressiveHDRDetails,
+    }),
+    progressive: buildDeliveryCapability(probe, {
+      video_codecs: probe.progressiveCodecsVideo,
+    }),
     hls: buildDeliveryCapability(probe, {
       supported_on_device: probe.hls,
       ...(probe.hls ? {} : { failure_reason: "media_source_extensions_unavailable" }),
       containers: ["hls"],
+      hdr_details: nonProgressiveHDRDetails,
     }),
   };
 }
@@ -219,7 +245,7 @@ export function buildClientPlaybackContextV3(probe: WebCapabilityProbe): ClientP
       platform: "web",
       ...(Object.keys(platformDetails).length > 0 ? { platform_details: platformDetails } : {}),
     },
-    output: {},
+    output: { hdr_details: probe.hdrDetails },
     deliveries: buildDeliveriesV3(probe),
   };
 }

@@ -699,11 +699,11 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		}
 		return terminalPlannerResultV3(reason, "The source requires video adaptation, but transcoding is unavailable.", false)
 	}
-	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
-		return terminalPlannerResultV3("no_alternate_version", TerminalMessage4KTranscodeDisabledV3, false)
-	}
 	if hdrTranscodeUnavailableV3(source) {
 		return terminalPlannerResultV3("hdr_transcode_unsupported", "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", false)
+	}
+	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
+		return terminalPlannerResultV3("no_alternate_version", TerminalMessage4KTranscodeDisabledV3, false)
 	}
 	if !input.hlsRegistry().Available(TransformationVideoToH264V3) || !input.hlsRegistry().Available(TransformationAudioToAACV3) {
 		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated H.264/AAC conversion toolchain is unavailable.", true)
@@ -772,9 +772,13 @@ func canStripDolbyVisionToHDR10V3(source SourceDescriptorV3, request StartReques
 }
 
 func canClientTransformDV7ToDV81V3(source SourceDescriptorV3, request StartRequestV3) bool {
-	return source.DynamicRange == DynamicRangeDolbyVisionV3 && source.DVProfile == 7 &&
-		clientSupportsDVProfileV3(request, 8) &&
-		clientTransformationAvailableV3(request, ClientDV7ToDV81V3, ClientDVTransformVersionV3)
+	if source.DynamicRange != DynamicRangeDolbyVisionV3 || source.DVProfile != 7 ||
+		!clientTransformationAvailableV3(request, ClientDV7ToDV81V3, ClientDVTransformVersionV3) {
+		return false
+	}
+	// The registered conversion recipe produces Profile 8.1.
+	source.DVBLCompatID = 1
+	return clientSupportsDVProfileV3(request, source, 8)
 }
 
 func canClientTransformDV7ToHDR10V3(source SourceDescriptorV3, request StartRequestV3) bool {
@@ -782,12 +786,13 @@ func canClientTransformDV7ToHDR10V3(source SourceDescriptorV3, request StartRequ
 		clientTransformationAvailableV3(request, ClientDV7ToHDR10V3, ClientDVTransformVersionV3)
 }
 
-func clientSupportsDVProfileV3(request StartRequestV3, profile int) bool {
+func clientSupportsDVProfileV3(request StartRequestV3, source SourceDescriptorV3, profile int) bool {
 	hdr := request.ClientPlaybackContext.Output.HDRDetails
 	if hdr == nil {
 		hdr = request.Capabilities.HDRDetails
 	}
-	return hdr != nil && containsIntV3(hdr.DolbyVisionProfiles, profile)
+	source.DVProfile = profile
+	return hdr != nil && hdrSupportsDolbyVisionSourceV3(*hdr, source)
 }
 
 func clientTransformationAvailableV3(request StartRequestV3, name, version string) bool {
@@ -1186,23 +1191,86 @@ func hdrDetailsSupportPlanV3(hdr HDRCapabilitiesV3, plan PlanV3) bool {
 	case "", DynamicRangeSDRV3:
 		return true
 	case DynamicRangeHDR10V3, "hdr_unknown":
-		return hdr.HDR10
+		return hdr.HDR10 && hdr10LimitsSupportPlanV3(hdr, plan)
 	case DynamicRangeHDR10PlusV3:
 		return hdr.HDR10Plus
 	case DynamicRangeHLGV3:
 		return hdr.HLG
 	case DynamicRangeDolbyVisionV3:
-		profile := plan.Source.DVProfile
+		candidate := plan.Source
 		for _, transformation := range plan.Transformations {
 			if transformation.Name == ClientDV7ToDV81V3 {
-				profile = 8
+				candidate.DVProfile = 8
+				candidate.DVBLCompatID = 1
 				break
 			}
 		}
-		return containsIntV3(hdr.DolbyVisionProfiles, profile)
+		return hdrSupportsDolbyVisionSourceV3(hdr, candidate)
 	default:
 		return false
 	}
+}
+
+func hdr10LimitsSupportPlanV3(hdr HDRCapabilitiesV3, plan PlanV3) bool {
+	return !(hdr.HDR10MaxWidth > 0 && (plan.EffectiveRecipe.Width == nil || *plan.EffectiveRecipe.Width > hdr.HDR10MaxWidth) ||
+		hdr.HDR10MaxHeight > 0 && (plan.EffectiveRecipe.Height == nil || *plan.EffectiveRecipe.Height > hdr.HDR10MaxHeight) ||
+		hdr.HDR10MaxFrameRate > 0 && (plan.EffectiveRecipe.FrameRate == nil || *plan.EffectiveRecipe.FrameRate > hdr.HDR10MaxFrameRate) ||
+		hdr.HDR10MaxBitrateKbps > 0 && (plan.EffectiveRecipe.BitrateKbps == nil || *plan.EffectiveRecipe.BitrateKbps > hdr.HDR10MaxBitrateKbps))
+}
+
+func hdrSupportsDolbyVisionSourceV3(hdr HDRCapabilitiesV3, source SourceDescriptorV3) bool {
+	if !containsIntV3(hdr.DolbyVisionProfiles, source.DVProfile) {
+		return false
+	}
+	var matchedCapability DolbyVisionProfileCapabilityV3
+	foundCapability := false
+	for _, capability := range hdr.DolbyVisionProfileLevels {
+		if capability.Profile == source.DVProfile {
+			matchedCapability = capability
+			foundCapability = true
+			break
+		}
+	}
+	if !foundCapability {
+		// Existing clients predate level-bounded Dolby Vision claims. Once a
+		// client sends any bounds, every advertised profile must have one.
+		return len(hdr.DolbyVisionProfileLevels) == 0
+	}
+	if len(matchedCapability.BLCompatibilityIDs) > 0 &&
+		!containsIntV3(matchedCapability.BLCompatibilityIDs, source.DVBLCompatID) {
+		return false
+	}
+	if source.DVLevel > 0 {
+		return source.DVLevel <= matchedCapability.MaxLevel
+	}
+	return dolbyVisionSourceFitsLevelV3(source, matchedCapability.MaxLevel)
+}
+
+func dolbyVisionSourceFitsLevelV3(source SourceDescriptorV3, maxLevel int) bool {
+	// Dolby Vision Version 2.0 defines levels by maximum pixel rate, decoded
+	// width, and high-tier bitrate. Use those physical bounds for legacy rows
+	// scanned before Silo persisted ffprobe's exact dv_level.
+	type levelLimit struct {
+		pixelRate   float64
+		width       int
+		bitrateKbps int
+	}
+	limits := map[int]levelLimit{
+		1: {22_118_400, 1280, 50_000}, 2: {27_648_000, 1280, 50_000},
+		3: {49_766_400, 1920, 70_000}, 4: {62_208_000, 2560, 70_000},
+		5: {124_416_000, 3840, 70_000}, 6: {199_065_600, 3840, 130_000},
+		7: {248_832_000, 3840, 130_000}, 8: {398_131_200, 3840, 130_000},
+		9: {497_664_000, 3840, 130_000}, 10: {995_328_000, 3840, 240_000},
+		11: {995_328_000, 7680, 240_000}, 12: {1_990_656_000, 7680, 480_000},
+		13: {3_981_312_000, 7680, 800_000},
+	}
+	limit, ok := limits[maxLevel]
+	if !ok || source.Width <= 0 || source.Height <= 0 || source.FrameRate <= 0 || source.BitrateKbps <= 0 {
+		return false
+	}
+	return source.Width <= limit.width &&
+		float64(source.Width*source.Height)*source.FrameRate <= limit.pixelRate &&
+		source.BitrateKbps <= limit.bitrateKbps
 }
 func ExplainPlannerResultV3(result PlannerResultV3) string {
 	if result.Plan != nil {

@@ -19,6 +19,7 @@ const (
 	FeatureRouteDiagnostics       = "playback_route_diagnostics"
 	FeatureDeviceQuirksV3         = "device_quirks_v1"
 	FeatureSeekReanchorV3         = "seek_reanchor_v1"
+	FeatureOutputChangeV3         = "output_change_v1"
 	FeatureDirectStreamResumeV3   = "direct_stream_resume_v1"
 	FeaturePlanSourceDurationV3   = "plan_source_duration_v1"
 	PlanRecipeVersionV3           = "v3.4"
@@ -42,6 +43,7 @@ func ServerFeaturesV3() []string {
 		FeatureRouteDiagnostics,
 		FeatureDeviceQuirksV3,
 		FeatureSeekReanchorV3,
+		FeatureOutputChangeV3,
 		FeatureDirectStreamResumeV3,
 		// Advertised so a client can tell "this server does not populate
 		// source.duration_seconds" apart from "this server knows the runtime
@@ -191,10 +193,21 @@ const (
 )
 
 type HDRCapabilitiesV3 struct {
-	HDR10               bool  `json:"hdr10"`
-	HDR10Plus           bool  `json:"hdr10_plus"`
-	HLG                 bool  `json:"hlg"`
-	DolbyVisionProfiles []int `json:"dolby_vision_profiles"`
+	HDR10                    bool                             `json:"hdr10"`
+	HDR10Plus                bool                             `json:"hdr10_plus"`
+	HLG                      bool                             `json:"hlg"`
+	HDR10MaxWidth            int                              `json:"hdr10_max_width,omitempty"`
+	HDR10MaxHeight           int                              `json:"hdr10_max_height,omitempty"`
+	HDR10MaxFrameRate        float64                          `json:"hdr10_max_frame_rate,omitempty"`
+	HDR10MaxBitrateKbps      int                              `json:"hdr10_max_bitrate_kbps,omitempty"`
+	DolbyVisionProfiles      []int                            `json:"dolby_vision_profiles"`
+	DolbyVisionProfileLevels []DolbyVisionProfileCapabilityV3 `json:"dolby_vision_profile_levels,omitempty"`
+}
+
+type DolbyVisionProfileCapabilityV3 struct {
+	Profile            int   `json:"profile"`
+	MaxLevel           int   `json:"max_level"`
+	BLCompatibilityIDs []int `json:"bl_compatibility_ids,omitempty"`
 }
 
 type AudioPassthroughV3 struct {
@@ -388,6 +401,9 @@ const (
 	// legacy transcode start: the client sends a quality_preference chosen from
 	// the plan's available_qualities and no failure classification.
 	ReplanOperationQualityChangeV3 ReplanOperationV3 = "quality_change"
+	// ReplanOperationOutputChangeV3 refreshes output capabilities without
+	// declaring the active route failed, so an unchanged route stays eligible.
+	ReplanOperationOutputChangeV3 ReplanOperationV3 = "output_change"
 )
 
 type ReplanRequestV3 struct {
@@ -543,6 +559,7 @@ type SourceDescriptorV3 struct {
 	DynamicRange       string             `json:"dynamic_range,omitempty"`
 	HDR10Plus          bool               `json:"hdr10_plus"`
 	DVProfile          int                `json:"dolby_vision_profile,omitempty"`
+	DVLevel            int                `json:"dolby_vision_level,omitempty"`
 	DVBLCompatID       int                `json:"dv_bl_compat_id,omitempty"`
 	DVEnhancementLayer EnhancementLayerV3 `json:"dv_enhancement_layer"`
 	AudioCodec         string             `json:"audio_codec,omitempty"`
@@ -809,6 +826,9 @@ func (r ReplanRequestV3) Validate() error {
 		// and never selects seek semantics.
 	case ReplanOperationTrackChangeV3:
 		// A user track change is not a failure; no classification is required.
+		if r.Failure != (FailureV3{}) {
+			return errors.New("track_change must not include failure")
+		}
 	case ReplanOperationQualityChangeV3:
 		// A user quality change is not a failure either, but it must actually
 		// name the wanted rung: an empty preference would silently mean "auto",
@@ -816,6 +836,14 @@ func (r ReplanRequestV3) Validate() error {
 		// operation models.
 		if strings.TrimSpace(r.QualityPreference) == "" {
 			return errors.New("quality_change requires a quality_preference")
+		}
+		if r.Failure != (FailureV3{}) {
+			return errors.New("quality_change must not include failure")
+		}
+	case ReplanOperationOutputChangeV3:
+		// Output capability refreshes are intent changes, not route failures.
+		if r.Failure != (FailureV3{}) {
+			return errors.New("output_change must not include failure")
 		}
 	default:
 		return errors.New("invalid replan operation")
@@ -902,16 +930,16 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		}
 	}
 	for _, hdr := range []*HDRCapabilitiesV3{c.HDRDetails, ctx.Output.HDRDetails} {
-		if hdr != nil && len(hdr.DolbyVisionProfiles) > 16 {
-			return errors.New("dolby vision profile list exceeds supported size")
+		if err := validateHDRCapabilitiesV3(hdr); err != nil {
+			return err
 		}
 	}
 	for name, delivery := range ctx.Deliveries {
 		if len(name) > 64 || len(delivery.Containers) > 64 || len(delivery.VideoCodecs) > 64 || len(delivery.AudioDecodeCodecs) > 64 || len(delivery.AudioPassthroughCodecs) > 64 || len(delivery.Features) > 64 || len(delivery.ValidatedClaims) > 64 || len(delivery.Transformations) > 16 {
 			return errors.New("delivery capability exceeds supported size")
 		}
-		if delivery.HDRDetails != nil && len(delivery.HDRDetails.DolbyVisionProfiles) > 16 {
-			return errors.New("dolby vision profile list exceeds supported size")
+		if err := validateHDRCapabilitiesV3(delivery.HDRDetails); err != nil {
+			return err
 		}
 		for _, values := range [][]string{delivery.Containers, delivery.VideoCodecs, delivery.AudioDecodeCodecs, delivery.AudioPassthroughCodecs, delivery.Features, delivery.ValidatedClaims} {
 			for _, value := range values {
@@ -961,6 +989,45 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 			if len(entry.Codec) > 64 || len(entry.ChannelCounts) > 32 || len(entry.Layouts) > 32 {
 				return errors.New("audio passthrough entry exceeds supported size")
 			}
+		}
+	}
+	return nil
+}
+
+func validateHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) error {
+	if hdr == nil {
+		return nil
+	}
+	if hdr.HDR10MaxWidth < 0 || hdr.HDR10MaxHeight < 0 || hdr.HDR10MaxFrameRate < 0 || hdr.HDR10MaxBitrateKbps < 0 {
+		return errors.New("invalid hdr10 capability limit")
+	}
+	if !hdr.HDR10 && (hdr.HDR10MaxWidth > 0 || hdr.HDR10MaxHeight > 0 || hdr.HDR10MaxFrameRate > 0 || hdr.HDR10MaxBitrateKbps > 0) {
+		return errors.New("hdr10 capability limits require hdr10 support")
+	}
+	if len(hdr.DolbyVisionProfiles) > 16 || len(hdr.DolbyVisionProfileLevels) > 16 {
+		return errors.New("dolby vision profile list exceeds supported size")
+	}
+	seenProfiles := make(map[int]struct{}, len(hdr.DolbyVisionProfileLevels))
+	for _, capability := range hdr.DolbyVisionProfileLevels {
+		if capability.Profile <= 0 || capability.MaxLevel < 1 || capability.MaxLevel > 13 {
+			return errors.New("invalid dolby vision profile level capability")
+		}
+		if _, exists := seenProfiles[capability.Profile]; exists {
+			return errors.New("duplicate dolby vision profile level capability")
+		}
+		seenProfiles[capability.Profile] = struct{}{}
+		if len(capability.BLCompatibilityIDs) > 16 {
+			return errors.New("dolby vision base-layer compatibility list exceeds supported size")
+		}
+		seenCompatibilityIDs := make(map[int]struct{}, len(capability.BLCompatibilityIDs))
+		for _, compatibilityID := range capability.BLCompatibilityIDs {
+			if compatibilityID < 0 || compatibilityID > 15 {
+				return errors.New("invalid dolby vision base-layer compatibility id")
+			}
+			if _, exists := seenCompatibilityIDs[compatibilityID]; exists {
+				return errors.New("duplicate dolby vision base-layer compatibility id")
+			}
+			seenCompatibilityIDs[compatibilityID] = struct{}{}
 		}
 	}
 	return nil

@@ -430,7 +430,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 		Registry: h.transformationRegistryV3(r.Context()), HLSRegistry: h.lazyHLSPlanningRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
 		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
 	})
-	if result.Terminal != nil && result.Terminal.Reason == "no_alternate_version" && shouldTryAlternateFileV3(req.QualityPreference) {
+	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) {
 		if alternate, alternateErr := h.findAlternateFile(r.Context(), requestedFile); alternateErr == nil && alternate != nil {
 			effectiveFile = h.ensurePlaybackProbe(r.Context(), alternate)
 			audioIndex = remapAudioIndexV3(requestedFile, effectiveFile, audioIndex)
@@ -1521,10 +1521,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	seekScopedRecovery := seekReanchor || seekFailureRecovery
 	trackChange := operation == playback.ReplanOperationTrackChangeV3
 	qualityChange := operation == playback.ReplanOperationQualityChangeV3
+	outputChange := operation == playback.ReplanOperationOutputChangeV3
 	// User-intent operations replace the legacy audio PATCH and client-recipe
 	// transcode start. Nothing failed, so their previous route stays eligible:
 	// neither attempted-key history nor the failed-plan exclusion applies.
-	userIntentOperation := trackChange || qualityChange
+	userIntentOperation := trackChange || qualityChange || outputChange
 	intentChange := false
 	if seekScopedRecovery {
 		if err := validateSeekRecoveryRequestV3(record, req); err != nil {
@@ -1559,6 +1560,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		case qualityChange:
 			nextQuality, _ := playback.NormalizeQualityV3(req.QualityPreference)
 			intentChange = nextQuality != start.QualityPreference
+		case outputChange:
+			intentChange = true
 		default:
 			switch req.Failure.Classification {
 			case "quality_changed":
@@ -1638,6 +1641,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "source_unavailable", message: "The effective media source is unavailable."}
 	}
 	effectiveFile := currentEffectiveFile
+	currentEffectiveStart := start
 	if intentChange && !trackChange {
 		// Prefer returning to the requested edition, but a quality/output/track
 		// change must not abandon a healthy active alternate merely because the
@@ -1651,13 +1655,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// from an eng/ac3 commentary track to the identically-shaped main
 		// track on a quality change.
 		if currentEffectiveFile.ID != effectiveFile.ID {
-			if err := remapAudioSelectionV3(currentEffectiveFile, effectiveFile, &start); err != nil {
-				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
+			candidateStart := start
+			remapErr := remapAudioSelectionV3(currentEffectiveFile, effectiveFile, &candidateStart)
+			if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
+				remapErr = h.remapSubtitleSelectionV3(r.Context(), currentEffectiveFile, effectiveFile, &candidateStart)
 			}
-			if start.SubtitleTrackIndex != nil || start.SubtitleTrackID != "" {
-				if err := h.remapSubtitleSelectionV3(r.Context(), currentEffectiveFile, effectiveFile, &start); err != nil {
-					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
-				}
+			if remapErr != nil && outputChange {
+				// An output refresh may make the requested edition viable again,
+				// but it must not retire a healthy active alternate merely because
+				// the viewer selected a track unique to that alternate.
+				effectiveFile = currentEffectiveFile
+			} else if remapErr != nil {
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: remapErr.Error()}
+			} else {
+				start = candidateStart
 			}
 		}
 	}
@@ -1732,7 +1743,21 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	} else {
 		result = playback.PlanPlaybackV3(playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: h.plannerSettingsV3(r.Context()), Registry: h.transformationRegistryV3(r.Context()), HLSRegistry: h.lazyHLSPlanningRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
 	}
-	if result.Terminal != nil && result.Terminal.Reason == "no_alternate_version" && replanAllowsAlternateFileV3(operation, start.QualityPreference) {
+	if outputChange && result.Terminal != nil && effectiveFile.ID != currentEffectiveFile.ID {
+		// Returning to the requested edition is speculative during an output
+		// refresh. Any terminal from that probe must fall back to the edition
+		// already playing, not only HDR/alternate-selection terminals: its audio,
+		// subtitle, or delivery constraints may still differ from the active file.
+		start = currentEffectiveStart
+		start.FileID = currentEffectiveFile.ID
+		effectiveFile = currentEffectiveFile
+		audioIndex, err = resolveV3AudioIndex(effectiveFile, start.AudioTrackID, start.AudioTrackIndex)
+		if err != nil {
+			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
+		}
+		result = playback.PlanPlaybackV3(playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: h.plannerSettingsV3(r.Context()), Registry: h.transformationRegistryV3(r.Context()), HLSRegistry: h.lazyHLSPlanningRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
+	}
+	if terminalAllowsAlternateFileV3(result.Terminal) && replanAllowsAlternateFileV3(operation, start.QualityPreference) {
 		if alternate, alternateErr := h.findAlternateFile(r.Context(), requestedFile); alternateErr == nil && alternate != nil {
 			alternate = h.ensurePlaybackProbe(r.Context(), alternate)
 			remappedAudio := remapAudioIndexV3(effectiveFile, alternate, audioIndex)
@@ -2334,12 +2359,26 @@ func shouldTryAlternateFileV3(qualityPreference string) bool {
 	return !strings.EqualFold(strings.TrimSpace(qualityPreference), "original")
 }
 
+const (
+	terminalNoAlternateVersionV3      = "no_alternate_version"
+	terminalHDRTranscodeUnsupportedV3 = "hdr_transcode_unsupported"
+)
+
+func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
+	if terminal == nil {
+		return false
+	}
+	return terminal.Reason == terminalNoAlternateVersionV3 || terminal.Reason == terminalHDRTranscodeUnsupportedV3
+}
+
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
 	switch operation {
-	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3:
-		// A quality change carries the same "another version may fit better"
-		// semantics its legacy quality_changed failure classification had; seek
-		// operations and track changes stay pinned to the mounted source.
+	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3, playback.ReplanOperationOutputChangeV3, playback.ReplanOperationTrackChangeV3:
+		// Quality, output, and track changes can make another version the only
+		// viable route. In particular, a bitmap subtitle can require video burn-in
+		// that an HDR source cannot support while an SDR alternate can. The
+		// subtitle identity is remapped before the alternate is adopted; seek-only
+		// operations remain pinned to the mounted source.
 		return shouldTryAlternateFileV3(qualityPreference)
 	default:
 		return false
@@ -2350,11 +2389,11 @@ func replanAlternateFilePinnedByOriginalQualityV3(operation playback.ReplanOpera
 	if shouldTryAlternateFileV3(qualityPreference) {
 		return false
 	}
-	return operation == playback.ReplanOperationFailureRecoveryV3 || operation == playback.ReplanOperationQualityChangeV3
+	return operation == playback.ReplanOperationFailureRecoveryV3 || operation == playback.ReplanOperationQualityChangeV3 || operation == playback.ReplanOperationOutputChangeV3
 }
 
 func (h *PlaybackHandler) clarifyOriginalQuality4KTerminalV3(ctx context.Context, terminal *playback.TerminalV3, requestedFile *models.MediaFile, alternateFilePinned bool) {
-	if !alternateFilePinned || terminal == nil || terminal.Reason != "no_alternate_version" || terminal.Message != playback.TerminalMessage4KTranscodeDisabledV3 {
+	if !alternateFilePinned || terminal == nil || terminal.Reason != terminalNoAlternateVersionV3 || terminal.Message != playback.TerminalMessage4KTranscodeDisabledV3 {
 		return
 	}
 	if alternate, err := h.findAlternateFile(ctx, requestedFile); err == nil && alternate != nil {

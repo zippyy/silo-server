@@ -509,3 +509,109 @@ func TestUnknownBitrateAdmittedBelowCap(t *testing.T) {
 		t.Fatalf("unknown-bitrate stream should be rejected at cap, got %+v", got)
 	}
 }
+
+func TestReserveTranscodeWorkSharesCapacityReservations(t *testing.T) {
+	capOne := 1
+	transcodes := NewTranscodePool()
+	transcodes.SetNodes([]*Node{
+		{URL: "http://transcode-a", Enabled: true, Healthy: true, MaxJobs: &capOne},
+		{URL: "http://transcode-b", Enabled: true, Healthy: true, MaxJobs: &capOne},
+	})
+	planner := NewPlanner(NewProxyPool(), transcodes)
+
+	first, releaseFirst := planner.ReserveTranscodeWork("download-1")
+	if first == nil || first.URL != "http://transcode-a" {
+		t.Fatalf("first node = %+v", first)
+	}
+	second, releaseSecond := planner.ReserveTranscodeWork("download-2")
+	if second == nil || second.URL != "http://transcode-b" {
+		t.Fatalf("second node = %+v", second)
+	}
+	if third, _ := planner.ReserveTranscodeWork("download-3"); third != nil {
+		t.Fatalf("third node = %+v, want no capacity", third)
+	}
+
+	releaseFirst()
+	third, releaseThird := planner.ReserveTranscodeWork("download-3")
+	if third == nil || third.URL != "http://transcode-a" {
+		t.Fatalf("third node after release = %+v", third)
+	}
+	releaseSecond()
+	releaseThird()
+}
+
+func TestReserveTranscodeWorkOverlappingAttemptsReleaseOnlyTheirOwnReservation(t *testing.T) {
+	capTwo := 2
+	transcodes := NewTranscodePool()
+	transcodes.SetNodes([]*Node{{URL: "http://transcode-a", Enabled: true, Healthy: true, MaxJobs: &capTwo}})
+	planner := NewPlanner(NewProxyPool(), transcodes)
+
+	first, releaseFirst := planner.ReserveTranscodeWork("same-artifact")
+	second, releaseSecond := planner.ReserveTranscodeWork("same-artifact")
+	if first == nil || second == nil {
+		t.Fatalf("overlapping reservations = first %+v second %+v", first, second)
+	}
+	if third, _ := planner.ReserveTranscodeWork("third-attempt"); third != nil {
+		t.Fatalf("third reservation = %+v, want full node", third)
+	}
+
+	releaseFirst()
+	third, releaseThird := planner.ReserveTranscodeWork("third-attempt")
+	if third == nil {
+		t.Fatal("first release did not free its own reservation")
+	}
+	if fourth, _ := planner.ReserveTranscodeWork("fourth-attempt"); fourth != nil {
+		t.Fatalf("second overlapping reservation was lost: fourth = %+v", fourth)
+	}
+
+	releaseSecond()
+	releaseThird()
+}
+
+func TestPlanDownloadSkipsBandwidthCappedProxiesAndReservesJobCapacity(t *testing.T) {
+	bandwidthCap := 100_000
+	jobCap := 1
+	proxies := NewProxyPool()
+	proxies.SetNodes([]*Node{
+		{URL: "http://bandwidth-capped", Enabled: true, Healthy: true, MaxBandwidthKbps: &bandwidthCap},
+		{URL: "http://uncapped", Enabled: true, Healthy: true, MaxJobs: &jobCap},
+	})
+	planner := NewPlanner(proxies, NewTranscodePool())
+
+	first := planner.PlanDownload("download-1")
+	if first.ProxyNode == nil || first.ProxyNode.URL != "http://uncapped" {
+		t.Fatalf("first plan = %+v", first)
+	}
+	if second := planner.PlanDownload("download-2"); second.ProxyNode != nil {
+		t.Fatalf("second plan = %+v, want job-cap rejection", second)
+	}
+	planner.ReleaseSession("download-1")
+	if second := planner.PlanDownload("download-2"); second.ProxyNode == nil {
+		t.Fatal("download was not admitted after reservation release")
+	}
+}
+
+func TestPlanDownloadPrefersArtifactOriginGroup(t *testing.T) {
+	groupA, groupB := "host-a", "host-b"
+	proxies := NewProxyPool()
+	proxies.SetNodes([]*Node{
+		{URL: "http://proxy-a", Group: &groupA, Enabled: true, Healthy: true},
+		{URL: "http://proxy-b", Group: &groupB, Enabled: true, Healthy: true},
+	})
+	planner := NewPlanner(proxies, NewTranscodePool())
+	plan := planner.PlanDownload("download-grouped", groupB)
+	if plan.ProxyNode == nil || plan.ProxyNode.URL != "http://proxy-b" {
+		t.Fatalf("plan = %+v, want proxy-b", plan)
+	}
+}
+
+func TestPlanDownloadFallsBackWhenOriginGroupHasNoProxy(t *testing.T) {
+	group := "host-a"
+	proxies := NewProxyPool()
+	proxies.SetNodes([]*Node{{URL: "http://proxy-a", Group: &group, Enabled: true, Healthy: true}})
+	planner := NewPlanner(proxies, NewTranscodePool())
+	plan := planner.PlanDownload("download-fallback", "host-missing")
+	if plan.ProxyNode == nil || plan.ProxyNode.URL != "http://proxy-a" {
+		t.Fatalf("plan = %+v, want proxy-a fallback", plan)
+	}
+}

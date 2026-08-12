@@ -97,23 +97,24 @@ the document is always the full one:
   "enabled": true,
   "protocol_versions": [3],
   "features": ["playback_plan_v3", "neutral_playback_v3_contract_v1", "layout_aware_passthrough", "playback_route_diagnostics",
-               "device_quirks_v1", "seek_reanchor_v1", "direct_stream_resume_v1",
+               "device_quirks_v1", "seek_reanchor_v1", "output_change_v1", "direct_stream_resume_v1",
                "plan_source_duration_v1"],
   "deliveries": ["original_http", "server_remux_progressive", "server_remux_hls", "server_transcode_hls"],
   "transformations": [{"name": "audio_to_aac", "executor": "server", "recipe_version": "1", "validated_claims": ["audio_decode"]}]
 }
 ```
 
-The eight feature strings above are the full set this server version advertises:
+The nine feature strings above are the full set this server version advertises:
 
 | Feature | What it promises |
 | --- | --- |
 | `playback_plan_v3` | The three plan endpoints exist and behave as specified here |
-| `neutral_playback_v3_contract_v1` | The server mints opaque `plan_attempt_key` values that clients only echo, and exposes `track_change` / `quality_change` as intent replans distinct from failure recovery |
+| `neutral_playback_v3_contract_v1` | The server mints opaque `plan_attempt_key` values that clients only echo, and exposes track/quality intent replans distinct from failure recovery |
 | `layout_aware_passthrough` | Audio passthrough is decided from channel *layouts*, not just channel counts (§3) |
 | `playback_route_diagnostics` | `POST /playback/route-events` is accepted |
 | `device_quirks_v1` | Plans may carry `applied_quirks` and `runtime_corrections` (§9) |
 | `seek_reanchor_v1` | The `seek_reanchor` replan operation is available (§6) |
+| `output_change_v1` | The `output_change` intent replan is available; clients must keep the active route when this feature is absent |
 | `direct_stream_resume_v1` | A direct route may resume mid-file rather than restarting |
 | `plan_source_duration_v1` | `source.duration_seconds` is populated when known, so its absence means *unknown* rather than *unsupported* (§5) |
 
@@ -380,6 +381,17 @@ HDR10, and the plan carries the `hdr_range_assumed_hdr10` degradation warning.
 Refusing to play those outright would be worse than an assumption the client is
 told about.
 
+The web client does not promote the generic high-dynamic-range media query to a
+format claim by itself. It combines that active-output signal with Media
+Capabilities support for Silo's progressive 2160p HEVC Main10, Rec. 2020, PQ,
+SMPTE ST 2086 shape before advertising HDR10. Dolby Vision likewise requires a
+definitive media-element answer for the exact `dvhe.05.06` or `dvhe.08.06`
+sample entry. Both claims are scoped to `progressive`: they are cleared from
+`original_http` and `hls` because those delivery paths were not tested by the
+same probe. An HDR10 claim can carry `hdr10_max_width`, `hdr10_max_height`,
+`hdr10_max_frame_rate`, and `hdr10_max_bitrate_kbps`; these ceilings keep a
+successful format probe from admitting an untested stream class.
+
 ---
 
 ## 4. Deliveries
@@ -485,7 +497,7 @@ The media's full runtime, and nothing else. Specifically:
 Replan is the only way a plan changes. It covers both "that didn't work" and
 "the user asked for something else," and the distinction matters to the server.
 
-`operation` is one of five:
+`operation` is one of six:
 
 | Operation | Meaning | Requires |
 | --- | --- | --- |
@@ -494,6 +506,7 @@ Replan is the only way a plan changes. It covers both "that didn't work" and
 | `seek_reanchor` | Move a server-anchored timeline to a new position | — |
 | `track_change` | The user picked a different audio or subtitle track | — |
 | `quality_change` | The user picked a rung from `available_qualities` | non-empty `quality_preference` |
+| `output_change` | The active display/output capabilities changed | — |
 
 The asymmetry is intentional. A seek reanchor is a timeline operation, not a
 failed recipe — a classification is still accepted from older callers but never
@@ -504,23 +517,25 @@ normalizes to `auto`, which is a different user intent than the menu selection
 the operation models, so the server rejects it rather than silently doing
 something else.
 
-**User-intent operations behave differently from failure recovery.**
-`track_change` and `quality_change` replace what were separate v2 endpoints (an
-audio PATCH and a client-posted transcode start). Nothing failed, so the previous
-route stays eligible: neither the attempted-key history nor the failed-plan
-exclusion applies. A client may therefore be handed back a plan it has already
-tried — that is correct here, and a client must not treat a repeated
-`plan_attempt_key` as a loop.
+**Intent operations behave differently from failure recovery.**
+`track_change`, `quality_change`, and `output_change` keep the previous route
+eligible because nothing established that its recipe failed: neither attempted-
+key history nor the failed-plan exclusion applies. The first two replace what
+were separate v2 endpoints (an audio PATCH and a client-posted transcode start).
+A client may therefore be handed back a plan it has already tried — that is
+correct here, and a client must not treat a repeated `plan_attempt_key` as a
+loop.
 
-When such an operation actually changes something — the request's tracks or
-quality differ from what the session currently has — the server also tries to
-return to the *requested* edition rather than staying on whatever alternate
-version a previous fallback landed on, since a user switching tracks may well
-want the original file back. That is a preference, not a guarantee: if the
-requested edition no longer resolves or fails its preflight, the healthy active
-alternate is kept. Track identities are remapped only when the edition really
-changes, because remapping within one file would degrade an exact selection to a
-best-match lookup and could silently move a listener off a commentary track.
+When such an operation actually changes something — the request's tracks,
+quality, or output capabilities differ from what the session currently has —
+the server also tries to return to the *requested* edition rather than staying
+on whatever alternate version a previous fallback landed on, since the newly
+requested intent may fit the original file again. That is a preference, not a
+guarantee: if the requested edition no longer resolves or fails its preflight,
+the healthy active alternate is kept. Track identities are remapped only when
+the edition really changes, because remapping within one file would degrade an
+exact selection to a best-match lookup and could silently move a listener off a
+commentary track.
 
 Omitting `quality_preference` on any replan preserves the session's current
 preference; sending it replaces that preference. A track change therefore does

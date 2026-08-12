@@ -9,12 +9,16 @@ import type { PlayerFileVersion, WatchPageProps } from "../types";
 import { WatchPage } from "./WatchPage";
 
 const playbackSessionMock = vi.hoisted(() => vi.fn());
+const videoPlayerMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../hooks/usePlaybackSession", () => ({
   usePlaybackSession: playbackSessionMock,
 }));
 vi.mock("./VideoPlayer", () => ({
-  VideoPlayer: () => "Mounted video player",
+  VideoPlayer: (props: unknown) => {
+    videoPlayerMock(props);
+    return "Mounted video player";
+  },
 }));
 vi.mock("../context/PlayerConfigContext", () => ({
   usePlayerConfig: () => ({
@@ -72,6 +76,7 @@ function playbackSession(
     durationSeconds: 3600,
     subtitleUrls: [],
     qualityPreference: "original",
+    shouldAutoPlay: true,
     loading: false,
     replacing: false,
     replanning: false,
@@ -85,6 +90,7 @@ function playbackSession(
     reanchorSeek: vi.fn(),
     refreshSubtitles: vi.fn(),
     applySubtitleTrack: vi.fn(),
+    updatePlaybackState: vi.fn(),
     reportEvent: vi.fn(),
     ...overrides,
   };
@@ -92,6 +98,7 @@ function playbackSession(
 
 beforeEach(() => {
   playbackSessionMock.mockReset();
+  videoPlayerMock.mockReset();
 });
 
 describe("derivePersistedSubtitleMode", () => {
@@ -133,5 +140,28 @@ describe("WatchPage playback errors", () => {
     expect(screen.getByText("Failed to start playback")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
     expect(screen.queryByText("Mounted video player")).not.toBeInTheDocument();
+  });
+});
+
+describe("WatchPage playback state", () => {
+  it("keeps the session resume anchor current while forwarding state", () => {
+    const updatePlaybackState = vi.fn();
+    const onPlaybackStateChange = vi.fn();
+    playbackSessionMock.mockReturnValue(playbackSession({ updatePlaybackState }));
+
+    render(createElement(WatchPage, { ...watchPageProps, onPlaybackStateChange }));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as {
+      onPlaybackStateChange?: (state: {
+        currentTime: number;
+        duration: number;
+        playing: boolean;
+      }) => void;
+    };
+    const state = { currentTime: 321, duration: 3600, playing: true };
+    props.onPlaybackStateChange?.(state);
+
+    expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
+    expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
   });
 });

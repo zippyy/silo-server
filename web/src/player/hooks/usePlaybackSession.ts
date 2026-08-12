@@ -14,6 +14,7 @@ import { reportRouteEventV3 } from "../route-events-v3";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
 import {
+  FEATURE_OUTPUT_CHANGE_V3,
   MAX_ATTEMPT_COUNT_V3,
   MAX_ATTEMPTED_PLAN_KEYS_V3,
   QUALITY_ORIGINAL_V3,
@@ -57,6 +58,7 @@ interface PlaybackSessionState {
   durationSeconds: number | null;
   subtitleUrls: PlayerSubtitleInfo[];
   qualityPreference: string;
+  shouldAutoPlay: boolean;
   loading: boolean;
   replacing: boolean;
   replanning: boolean;
@@ -91,6 +93,8 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   refreshSubtitles: (currentPosition: number) => void;
   /** Folds a realtime-delivered inventory entry in without a server round trip. */
   applySubtitleTrack: (track: SubtitleInventoryItemV3) => void;
+  /** Keeps transport state current for output-capability replans. */
+  updatePlaybackState: (positionSeconds: number, playing: boolean) => void;
   /** Reports a playback route event as a diagnostic. Never affects playback. */
   reportEvent: (
     event: RouteEventNameV3,
@@ -159,6 +163,7 @@ function planToSessionState(
   playbackAttemptId: string,
   planRevision: number,
   qualityPreference: string,
+  shouldAutoPlay: boolean,
   config: PlayerConfig,
 ): PlaybackSessionState {
   return {
@@ -177,6 +182,7 @@ function planToSessionState(
       config,
     ),
     qualityPreference,
+    shouldAutoPlay,
     loading: false,
     replacing: false,
     replanning: false,
@@ -250,6 +256,10 @@ export function usePlaybackSession(
   const probe = useCodecDetection();
   const clientCapabilities = useMemo(() => buildClientCapabilitiesV3(probe), [probe]);
   const clientPlaybackContext = useMemo(() => buildClientPlaybackContextV3(probe), [probe]);
+  const capabilityRequestKey = useMemo(
+    () => JSON.stringify([clientCapabilities, clientPlaybackContext]),
+    [clientCapabilities, clientPlaybackContext],
+  );
 
   const [state, setState] = useState<PlaybackSessionState>({
     plan: null,
@@ -263,6 +273,7 @@ export function usePlaybackSession(
     durationSeconds: null,
     subtitleUrls: [],
     qualityPreference: qualityPreference?.trim() || "auto",
+    shouldAutoPlay: true,
     loading: true,
     replacing: false,
     replanning: false,
@@ -273,8 +284,19 @@ export function usePlaybackSession(
   const sessionIdRef = useRef<string | null>(null);
   const planRef = useRef<PlanV3 | null>(null);
   const planRevisionRef = useRef(0);
+  const serverFeaturesRef = useRef<string[]>([]);
   const stateRef = useRef(state);
   const activeRequestKeyRef = useRef<string | null>(null);
+  const activeCapabilityRequestKeyRef = useRef<string | null>(null);
+  const playbackPositionRef = useRef(initialPosition);
+  const startIntentRef = useRef({
+    position: initialPosition,
+    forceStartPosition: forceInitialPosition,
+  });
+  const hasAdoptedPlanRef = useRef(false);
+  const awaitingInitialPlayerPositionRef = useRef(false);
+  const playbackPlayingRef = useRef(true);
+  const playbackStartedRef = useRef(false);
   const switchingRef = useRef(false);
   const loadSequenceRef = useRef(0);
 
@@ -290,7 +312,13 @@ export function usePlaybackSession(
   const pendingReplanRef = useRef<{
     options: ReplanOptions;
     loadSequence: number;
+    retireSessionOnRefusal: boolean;
+    resolve: (adopted: boolean) => void;
+    planId: string;
   } | null>(null);
+  const issueReplanRef = useRef<
+    (options: ReplanOptions, retireSessionOnRefusal?: boolean) => Promise<boolean>
+  >(async () => false);
   const qualityRef = useRef(qualityPreference?.trim() || "auto");
 
   useEffect(() => {
@@ -325,6 +353,7 @@ export function usePlaybackSession(
    */
   const adoptDecision = useCallback(
     (decision: DecisionResponseV3): boolean => {
+      serverFeaturesRef.current = decision.server_features;
       const plan = decision.playback_plan;
       if (!plan) {
         const failure = describeDecisionWithoutPlan(decision);
@@ -350,6 +379,17 @@ export function usePlaybackSession(
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
       planRevisionRef.current += 1;
+      hasAdoptedPlanRef.current = true;
+      if (
+        Number.isFinite(plan.timeline.source_start_seconds) &&
+        plan.timeline.source_start_seconds >= 0
+      ) {
+        // Replan positions use the source timeline. Seed it immediately so an
+        // output refresh before the first timeupdate preserves server-resolved
+        // resume state instead of falling back to the caller's default zero.
+        playbackPositionRef.current = plan.timeline.source_start_seconds;
+        awaitingInitialPlayerPositionRef.current = plan.timeline.source_start_seconds > 0;
+      }
 
       setState(
         planToSessionState(
@@ -358,6 +398,7 @@ export function usePlaybackSession(
           playbackAttemptIdRef.current ?? "",
           planRevisionRef.current,
           qualityRef.current,
+          playbackPlayingRef.current,
           config,
         ),
       );
@@ -404,6 +445,37 @@ export function usePlaybackSession(
       });
     },
     [config],
+  );
+
+  const retireActiveSession = useCallback(
+    (expectedSessionId: string) => {
+      if (sessionIdRef.current !== expectedSessionId) return;
+      loadSequenceRef.current += 1;
+      void stopSession(expectedSessionId).catch(() => {
+        // Best effort — stale session will time out server-side.
+      });
+      planRef.current = null;
+      sessionIdRef.current = null;
+      planAttemptIdRef.current = randomUUID();
+      setState((current) => {
+        if (current.sessionId !== expectedSessionId) return current;
+        return {
+          ...current,
+          plan: null,
+          streamUrl: null,
+          sessionId: null,
+          mediaFileId: null,
+          initialPosition: 0,
+          audioTrackIndex: 0,
+          durationSeconds: null,
+          subtitleUrls: [],
+          loading: false,
+          replacing: false,
+          replanning: false,
+        };
+      });
+    },
+    [stopSession],
   );
 
   /**
@@ -572,7 +644,17 @@ export function usePlaybackSession(
       return;
     }
     activeRequestKeyRef.current = requestKey;
+    activeCapabilityRequestKeyRef.current = capabilityRequestKey;
     qualityRef.current = qualityPreference?.trim() || "auto";
+    playbackPositionRef.current = initialPosition;
+    startIntentRef.current = {
+      position: initialPosition,
+      forceStartPosition: forceInitialPosition,
+    };
+    hasAdoptedPlanRef.current = false;
+    awaitingInitialPlayerPositionRef.current = false;
+    playbackPlayingRef.current = true;
+    playbackStartedRef.current = false;
 
     void loadSession({
       preferredFileId: fileId,
@@ -582,7 +664,15 @@ export function usePlaybackSession(
       replacementErrorMessage: "Failed to replace playback request",
       initialErrorMessage: "Failed to start playback",
     });
-  }, [fileId, forceInitialPosition, initialPosition, loadSession, qualityPreference, requestKey]);
+  }, [
+    capabilityRequestKey,
+    fileId,
+    forceInitialPosition,
+    initialPosition,
+    loadSession,
+    qualityPreference,
+    requestKey,
+  ]);
 
   // Clean up session on unmount.
   useEffect(() => {
@@ -619,7 +709,10 @@ export function usePlaybackSession(
    * means the client never asks for one.
    */
   const replan = useCallback(
-    async function issueReplan(options: ReplanOptions): Promise<boolean> {
+    async function issueReplan(
+      options: ReplanOptions,
+      retireSessionOnRefusal = false,
+    ): Promise<boolean> {
       const plan = planRef.current;
       const sessionId = sessionIdRef.current;
       const playbackAttemptId = playbackAttemptIdRef.current;
@@ -627,17 +720,51 @@ export function usePlaybackSession(
       if (replanInFlightRef.current) {
         const isPendingFailureRecovery =
           options.operation === "failure_recovery" || options.operation === "seek_failure_recovery";
+        const isPendingOutputChange = options.operation === "output_change";
         const queuedOperation = pendingReplanRef.current?.options.operation;
         const hasQueuedFailureRecovery =
           queuedOperation === "failure_recovery" || queuedOperation === "seek_failure_recovery";
+        const hasQueuedOutputChange = queuedOperation === "output_change";
         if (
-          isPendingFailureRecovery ||
-          (options.operation === "seek_reanchor" && !hasQueuedFailureRecovery)
+          options.operation === "seek_reanchor" &&
+          hasQueuedOutputChange &&
+          pendingReplanRef.current
         ) {
+          // The output refresh will open a fresh route at its position anyway;
+          // fold a later seek into that queued intent rather than silently
+          // dropping the viewer's newest target.
           pendingReplanRef.current = {
-            options,
-            loadSequence: loadSequenceRef.current,
+            ...pendingReplanRef.current,
+            options: {
+              ...pendingReplanRef.current.options,
+              positionSeconds: options.positionSeconds,
+            },
           };
+          return false;
+        }
+        const isPendingUserIntent =
+          options.operation === "track_change" || options.operation === "quality_change";
+        const hasQueuedUserIntent =
+          queuedOperation === "track_change" || queuedOperation === "quality_change";
+        const shouldQueue =
+          isPendingFailureRecovery ||
+          (isPendingUserIntent && !hasQueuedFailureRecovery) ||
+          (isPendingOutputChange && !hasQueuedFailureRecovery && !hasQueuedUserIntent) ||
+          (options.operation === "seek_reanchor" &&
+            !hasQueuedFailureRecovery &&
+            !hasQueuedOutputChange &&
+            !hasQueuedUserIntent);
+        if (shouldQueue) {
+          pendingReplanRef.current?.resolve(false);
+          return new Promise<boolean>((resolve) => {
+            pendingReplanRef.current = {
+              options,
+              loadSequence: loadSequenceRef.current,
+              retireSessionOnRefusal,
+              resolve,
+              planId: plan.plan_id,
+            };
+          });
         }
         return false;
       }
@@ -654,8 +781,8 @@ export function usePlaybackSession(
         return false;
       }
 
-      // On a track or quality change nothing failed, so the previous route
-      // stays eligible: the loop guard and the recovery counter reset. Only a
+      // On an intent change nothing failed, so the previous route stays
+      // eligible: the loop guard and the recovery counter reset. Only a
       // recovery accumulates them.
       const attemptedPlanKeys = isFailureRecovery
         ? [...attemptedPlanKeysRef.current, plan.plan_attempt_key].slice(
@@ -708,9 +835,34 @@ export function usePlaybackSession(
           attemptCountRef.current = 1;
         }
 
-        return adoptDecision(decision);
+        const adopted = adoptDecision(decision);
+        if (!adopted && retireSessionOnRefusal) {
+          const pending = pendingReplanRef.current;
+          const pendingCanValidateOutput =
+            pending?.loadSequence === loadSequence &&
+            pending.options.operation !== "seek_reanchor" &&
+            pending.options.operation !== "seek_failure_recovery";
+          if (pending && pendingCanValidateOutput) {
+            // The output refusal proves the predecessor route is incompatible.
+            // Let a queued planner-backed intent try the latest output evidence,
+            // but require it to retire the session too if it is refused. Frozen
+            // seek replans cannot validate new output evidence, so they must not
+            // postpone retirement.
+            pendingReplanRef.current = {
+              ...pending,
+              retireSessionOnRefusal: true,
+            };
+          } else {
+            retireActiveSession(sessionId);
+          }
+        }
+        return adopted;
       } catch (err) {
         if (loadSequence !== loadSequenceRef.current) return false;
+        if (retireSessionOnRefusal) {
+          console.error("Failed to refresh playback output", err);
+          return false;
+        }
         const nextError = describePlaybackSessionError(err, "Failed to update playback");
         setState((current) => ({
           ...current,
@@ -726,12 +878,74 @@ export function usePlaybackSession(
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
         if (pendingReplan?.loadSequence === loadSequenceRef.current) {
-          void issueReplan(pendingReplan.options);
+          const recoveryAppliesToCurrentPlan =
+            pendingReplan.options.operation !== "failure_recovery" &&
+            pendingReplan.options.operation !== "seek_failure_recovery"
+              ? true
+              : pendingReplan.planId === planRef.current?.plan_id;
+          if (recoveryAppliesToCurrentPlan) {
+            // A capability change can queue behind a replan created by an older
+            // render. Dispatch through the latest callback so its request carries
+            // the current output evidence rather than the closed-over snapshot.
+            void issueReplanRef
+              .current(pendingReplan.options, pendingReplan.retireSessionOnRefusal)
+              .then(pendingReplan.resolve);
+          } else {
+            pendingReplan.resolve(false);
+          }
+        } else {
+          pendingReplan?.resolve(false);
         }
       }
     },
-    [adoptDecision, clientCapabilities, clientPlaybackContext, config, maxBitrateKbps],
+    [
+      adoptDecision,
+      clientCapabilities,
+      clientPlaybackContext,
+      config,
+      maxBitrateKbps,
+      retireActiveSession,
+    ],
   );
+  issueReplanRef.current = replan;
+
+  useEffect(() => {
+    if (
+      activeRequestKeyRef.current !== requestKey ||
+      activeCapabilityRequestKeyRef.current === capabilityRequestKey
+    ) {
+      return;
+    }
+    activeCapabilityRequestKeyRef.current = capabilityRequestKey;
+
+    const plan = planRef.current;
+    const sessionId = sessionIdRef.current;
+    if (!plan || !sessionId) {
+      const startIntent = startIntentRef.current;
+      const resumeFromAdoptedPlan = hasAdoptedPlanRef.current;
+      void loadSession({
+        preferredFileId: fileId,
+        position: resumeFromAdoptedPlan ? playbackPositionRef.current : startIntent.position,
+        forceStartPosition: resumeFromAdoptedPlan ? true : startIntent.forceStartPosition,
+        allowPreserveExistingSessionOnError: false,
+        replacementErrorMessage: "Failed to refresh playback output",
+        initialErrorMessage: "Failed to refresh playback output",
+      });
+      return;
+    }
+
+    if (!serverFeaturesRef.current.includes(FEATURE_OUTPUT_CHANGE_V3)) {
+      return;
+    }
+
+    void replan(
+      {
+        operation: "output_change",
+        positionSeconds: playbackPositionRef.current,
+      },
+      true,
+    );
+  }, [capabilityRequestKey, fileId, loadSession, replan, requestKey, retireActiveSession]);
 
   const switchAudioTrack = useCallback(
     (index: number, currentPosition: number) => {
@@ -796,6 +1010,8 @@ export function usePlaybackSession(
 
   const reanchorSeek = useCallback(
     (positionSeconds: number) => {
+      playbackPositionRef.current = positionSeconds;
+      awaitingInitialPlayerPositionRef.current = false;
       reportEvent("seek_reanchor_requested");
       void replan({ operation: "seek_reanchor", positionSeconds });
     },
@@ -841,6 +1057,26 @@ export function usePlaybackSession(
     [config],
   );
 
+  const updatePlaybackState = useCallback((positionSeconds: number, playing: boolean) => {
+    if (Number.isFinite(positionSeconds) && positionSeconds >= 0) {
+      const isUninitializedPlayerZero =
+        awaitingInitialPlayerPositionRef.current &&
+        !playing &&
+        positionSeconds === 0 &&
+        playbackPositionRef.current > 0;
+      if (!isUninitializedPlayerZero) {
+        playbackPositionRef.current = positionSeconds;
+        awaitingInitialPlayerPositionRef.current = false;
+      }
+    }
+    if (playing) {
+      playbackStartedRef.current = true;
+      playbackPlayingRef.current = true;
+    } else if (playbackStartedRef.current) {
+      playbackPlayingRef.current = false;
+    }
+  }, []);
+
   const switchVersion = useCallback(
     (newFileId: number, currentPosition: number) => {
       if (switchingRef.current) return;
@@ -878,6 +1114,7 @@ export function usePlaybackSession(
     reanchorSeek,
     refreshSubtitles,
     applySubtitleTrack,
+    updatePlaybackState,
     reportEvent,
   };
 }

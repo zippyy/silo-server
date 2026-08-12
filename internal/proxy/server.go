@@ -1,18 +1,25 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 
+	"github.com/Silo-Server/silo-server/internal/downloadprepare"
+	"github.com/Silo-Server/silo-server/internal/downloads"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -21,13 +28,25 @@ import (
 
 // Server is the HTTP handler for proxy mode.
 type Server struct {
-	watcher    *nodeconfig.Watcher
-	tracker    *nodesessions.Tracker
-	httpClient *http.Client
-	egress     *egressMeter
+	watcher              *nodeconfig.Watcher
+	tracker              *nodesessions.Tracker
+	httpClient           *http.Client
+	artifactMissReporter remoteArtifactMissReporter
+	egress               *egressMeter
 	// subCache stores full-track PGS (.sup) extracts under the transcode dir
 	// so repeat selections skip the whole-file ffmpeg demux.
 	subCache *playback.SubtitleCache
+	// Download limits are node-local once egress is delegated. Rebuild the
+	// manager when hot-reloaded settings change so existing transfers retain
+	// their original limiter while new transfers use the new values.
+	downloadBandwidthMu sync.Mutex
+	downloadBandwidth   *downloads.BandwidthManager
+	downloadServerBPS   int64
+	downloadUserBPS     int64
+}
+
+type remoteArtifactMissReporter interface {
+	ReportRemoteArtifactMissing(ctx context.Context, artifactID, originNodeURL, originArtifactID string) error
 }
 
 // NewServer creates a new proxy server backed by a config watcher and session
@@ -38,12 +57,24 @@ func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Serv
 		tracker: tracker,
 		// No overall timeout — stream bodies are long-lived. Hung nodes are
 		// bounded by the transport's response-header timeout instead.
-		httpClient: &http.Client{Transport: newStreamTransport()},
-		egress:     newEgressMeter(),
+		httpClient: &http.Client{
+			Transport: newStreamTransport(),
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		egress: newEgressMeter(),
 		subCache: playback.NewSubtitleCache(func() string {
 			return watcher.Config().Playback.TranscodeDir
 		}),
 	}
+}
+
+// SetRemoteArtifactMissReporter wires the authoritative database transition
+// used when an origin returns 404 after the API's proxy preflight. It must be
+// called during construction, before the server begins handling requests.
+func (s *Server) SetRemoteArtifactMissReporter(reporter remoteArtifactMissReporter) {
+	s.artifactMissReporter = reporter
 }
 
 // newStreamTransport tunes the proxy→transcode-node connection pool. Many
@@ -68,13 +99,15 @@ func (s *Server) Handler() http.Handler {
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "HEAD", "OPTIONS"},
-		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type", "Range"},
-		MaxAge:         86400,
+		AllowedHeaders: []string{
+			"Accept", "Authorization", "Content-Type", "Range",
+			"If-Match", "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since",
+		},
+		MaxAge: 86400,
 	}))
 	r.Get("/api/v1/health", s.handleHealth)
 	r.Group(func(r chi.Router) {
-		// Everything under /stream counts toward the node's measured
-		// egress bandwidth.
+		// Streaming and download bytes count toward the node's measured egress.
 		r.Use(s.meterEgress)
 		r.Head("/stream/direct/{token}", s.handleDirectPlay)
 		r.Get("/stream/direct/{token}", s.handleDirectPlay)
@@ -85,6 +118,8 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/stream/transcode/{token}/segment/{name}", s.handleTranscodeSegment)
 		r.Get("/stream/subtitles/{token}/{track}/fonts", s.handleSubtitleFonts)
 		r.Get("/stream/subtitles/{token}/{track}", s.handleSubtitle)
+		r.Head("/downloads/file/{token}", s.handleDownloadFile)
+		r.Get("/downloads/file/{token}", s.handleDownloadFile)
 	})
 
 	// Admin routes — bearer-auth protected.
@@ -151,6 +186,126 @@ func (s *Server) handleDirectPlay(w http.ResponseWriter, r *http.Request) {
 	defer s.tracker.Remove(r.Context(), claims.SessionID)
 
 	http.ServeFile(w, r, claims.MediaPath)
+}
+
+func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
+	claims := s.verifyToken(w, r)
+	if claims == nil {
+		return
+	}
+	remoteArtifact := claims.DownloadArtifactID != "" && strings.TrimSpace(claims.TranscodeNode) != ""
+	if claims.PlayMethod != streamtoken.PlayMethodDownload || (strings.TrimSpace(claims.MediaPath) == "" && !remoteArtifact) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// HEAD is a capability/path preflight, not an active transfer. Counting it
+	// would briefly consume job capacity and could make a health report retire
+	// the API's reservation before the client starts its GET.
+	if s.tracker != nil && r.Method != http.MethodHead {
+		info := sessionInfo(s.tracker, claims, "download")
+		s.tracker.Track(r.Context(), info)
+		defer s.tracker.Remove(context.WithoutCancel(r.Context()), claims.SessionID)
+	}
+	if remoteArtifact {
+		s.relayDownloadArtifact(w, r, claims)
+		return
+	}
+
+	f, err := os.Open(claims.MediaPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	stat, err := f.Stat()
+	if err != nil {
+		http.Error(w, "download unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	filename := filepath.Base(claims.MediaPath)
+	if disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename}); disposition != "" {
+		w.Header().Set("Content-Disposition", disposition)
+	}
+	w.Header().Set("Content-Type", playback.MimeFromExtension(claims.MediaPath))
+	reader := io.ReadSeeker(f)
+	if bandwidth := s.downloadBandwidthManager(); bandwidth != nil {
+		reader = bandwidth.ThrottledReader(r.Context(), f, claims.UserID)
+	}
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), reader)
+}
+
+func (s *Server) relayDownloadArtifact(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims) {
+	if !downloadprepare.ValidArtifactID(claims.DownloadArtifactID) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	cfg := s.watcher.Config()
+	if cfg == nil || strings.TrimSpace(cfg.Auth.JWTSecret) == "" {
+		http.Error(w, "download unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	client := downloadprepare.HTTPPreparer{Client: s.httpClient}
+	resp, err := client.Open(r.Context(), claims.TranscodeNode, cfg.Auth.JWTSecret, claims.DownloadArtifactID, r.Method, r.Header)
+	if err != nil {
+		slog.WarnContext(r.Context(), "download artifact relay failed", "component", "proxy", "artifact_id", claims.DownloadArtifactID, "node", claims.TranscodeNode, "error", err)
+		http.Error(w, "download unavailable", http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		if s.artifactMissReporter != nil && strings.TrimSpace(claims.DownloadArtifactRowID) != "" {
+			reportCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			err := s.artifactMissReporter.ReportRemoteArtifactMissing(
+				reportCtx, claims.DownloadArtifactRowID, claims.TranscodeNode, claims.DownloadArtifactID,
+			)
+			cancel()
+			if err != nil {
+				slog.WarnContext(r.Context(), "report missing remote download artifact", "component", "proxy", "artifact_id", claims.DownloadArtifactRowID, "error", err)
+			}
+		}
+		http.NotFound(w, r)
+		return
+	}
+	if !downloadprepare.RelayStatusAllowed(resp.StatusCode) {
+		http.Error(w, "download unavailable", http.StatusBadGateway)
+		return
+	}
+	downloadprepare.CopyResponseHeaders(w.Header(), resp.Header)
+	if filename := filepath.Base(strings.TrimSpace(claims.DownloadFilename)); filename != "" && filename != "." {
+		if disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename}); disposition != "" {
+			w.Header().Set("Content-Disposition", disposition)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if r.Method == http.MethodHead {
+		return
+	}
+	var reader io.Reader = resp.Body
+	if bandwidth := s.downloadBandwidthManager(); bandwidth != nil {
+		reader = bandwidth.ThrottledStreamReader(r.Context(), reader, claims.UserID)
+	}
+	if _, err := io.Copy(w, reader); err != nil && r.Context().Err() == nil {
+		slog.WarnContext(r.Context(), "download artifact relay interrupted", "component", "proxy", "artifact_id", claims.DownloadArtifactID, "error", err)
+	}
+}
+
+func (s *Server) downloadBandwidthManager() *downloads.BandwidthManager {
+	cfg := s.watcher.Config()
+	if cfg == nil {
+		return nil
+	}
+	serverBPS := cfg.Download.ServerBandwidthBPS
+	userBPS := cfg.Download.UserBandwidthBPS
+	s.downloadBandwidthMu.Lock()
+	defer s.downloadBandwidthMu.Unlock()
+	if s.downloadBandwidth == nil || serverBPS != s.downloadServerBPS || userBPS != s.downloadUserBPS {
+		s.downloadBandwidth = downloads.NewBandwidthManager(serverBPS, userBPS)
+		s.downloadServerBPS = serverBPS
+		s.downloadUserBPS = userBPS
+	}
+	return s.downloadBandwidth
 }
 
 func (s *Server) handleRemux(w http.ResponseWriter, r *http.Request) {

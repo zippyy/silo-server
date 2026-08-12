@@ -28,6 +28,7 @@ func TestServerFeaturesV3ReturnsCompleteIndependentSlices(t *testing.T) {
 		FeatureRouteDiagnostics:     {},
 		FeatureDeviceQuirksV3:       {},
 		FeatureSeekReanchorV3:       {},
+		FeatureOutputChangeV3:       {},
 		FeatureDirectStreamResumeV3: {},
 		FeaturePlanSourceDurationV3: {},
 	}
@@ -165,6 +166,19 @@ func TestReplanRequestV3OperationDefaultsAndValidates(t *testing.T) {
 	if err := request.Validate(); err != nil {
 		t.Fatalf("track change without a failure classification: %v", err)
 	}
+	for _, operation := range []ReplanOperationV3{
+		ReplanOperationTrackChangeV3,
+		ReplanOperationQualityChangeV3,
+		ReplanOperationOutputChangeV3,
+	} {
+		request.Operation = operation
+		request.QualityPreference = "720p"
+		request.Failure = FailureV3{Classification: "decoder_failure"}
+		if err := request.Validate(); err == nil {
+			t.Fatalf("%s with failure was accepted", operation)
+		}
+	}
+	request.Failure = FailureV3{}
 
 	request.Operation = ReplanOperationQualityChangeV3
 	request.QualityPreference = ""
@@ -176,9 +190,35 @@ func TestReplanRequestV3OperationDefaultsAndValidates(t *testing.T) {
 		t.Fatalf("quality change without a failure classification: %v", err)
 	}
 
+	request.Operation = ReplanOperationOutputChangeV3
+	request.QualityPreference = ""
+	if err := request.Validate(); err != nil {
+		t.Fatalf("output change without a failure classification: %v", err)
+	}
+
 	request.Operation = "future_operation"
 	if err := request.Validate(); err == nil {
 		t.Fatal("unknown replan operation was accepted")
+	}
+}
+
+func TestHDR10CapabilityLimitsBoundTheClaimedStreamClass(t *testing.T) {
+	width, height, frameRate, bitrate := 3840, 2160, 24.0, 80_000
+	plan := PlanV3{EffectiveRecipe: EffectiveRecipeV3{
+		VideoCodec: "hevc", Width: &width, Height: &height, FrameRate: &frameRate,
+		BitrateKbps: &bitrate, DynamicRange: DynamicRangeHDR10V3,
+	}}
+	hdr := HDRCapabilitiesV3{
+		HDR10: true, HDR10MaxWidth: 3840, HDR10MaxHeight: 2160,
+		HDR10MaxFrameRate: 24, HDR10MaxBitrateKbps: 80_000,
+	}
+	if !hdrDetailsSupportPlanV3(hdr, plan) {
+		t.Fatal("the exactly probed HDR10 stream class was rejected")
+	}
+	tooFast := 60.0
+	plan.EffectiveRecipe.FrameRate = &tooFast
+	if hdrDetailsSupportPlanV3(hdr, plan) {
+		t.Fatal("an HDR10 stream above the probed frame-rate ceiling was accepted")
 	}
 }
 
@@ -297,7 +337,7 @@ func TestProtocolV3ConformanceMatrixCoversReleaseTrain(t *testing.T) {
 	}
 	for _, required := range []string{
 		"evidence_tier_gating", "deliveries_negotiation", "attempt_key_echo_and_loop",
-		"track_change_replan", "quality_change_replan", "idempotent_replan",
+		"track_change_replan", "quality_change_replan", "output_change_replan", "idempotent_replan",
 		"concurrent_replan", "mid_seek_replan", "available_qualities",
 		"audio_only_planning", "output_context_invalidation", "legacy_426",
 		"hdr_dv_matrix", "audio_matrix", "subtitle_matrix", "recovery_matrix",
@@ -945,6 +985,80 @@ func TestPlanPlaybackV3NeverClaimsUnimplementedHDRTranscode(t *testing.T) {
 	}
 }
 
+func TestPlanPlaybackV3ReportsHDRLimitationBefore4KPolicy(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.Resolution = "2160p"
+	file.VideoTracks[0].Width = 3840
+	file.VideoTracks[0].Height = 2160
+	req := validStartRequestV3()
+	req.Capabilities.HDRDetails = nil
+	req.ClientPlaybackContext.Output.HDRDetails = nil
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: false},
+	})
+	if result.Terminal == nil || result.Terminal.Reason != "hdr_transcode_unsupported" {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestPlanPlaybackV3HonorsDolbyVisionLevelBound(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.VideoTracks[0].VideoRange = "DolbyVision"
+	file.VideoTracks[0].VideoRangeType = "DOVIWithHDR10"
+	file.VideoTracks[0].DVProfile = 8
+	file.VideoTracks[0].DVLevel = 7
+	file.VideoTracks[0].DVBLCompatID = 1
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+		Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10},
+		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true,
+	}}
+	hdr := &HDRCapabilitiesV3{
+		DolbyVisionProfiles: []int{8},
+		DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{
+			Profile: 8, MaxLevel: 6, BLCompatibilityIDs: []int{1},
+		}},
+	}
+	req.Capabilities.HDRDetails = hdr
+	req.ClientPlaybackContext.Output.HDRDetails = hdr
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+	})
+	if result.Terminal == nil || result.Terminal.Reason != "hdr_transcode_unsupported" {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+
+	file.VideoTracks[0].DVLevel = 6
+	result = PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+	})
+	if result.Plan == nil || !result.Plan.Claims.Video.DolbyVision {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+
+	file.VideoTracks[0].DVBLCompatID = 4
+	result = PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+	})
+	if result.Terminal == nil || result.Terminal.Reason != "hdr_transcode_unsupported" {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestSourceDescriptorV3OmitsInvalidDolbyVisionLevel(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.VideoTracks[0].DVLevel = 14
+	if got := SourceDescriptorFromFileV3(file, 0).DVLevel; got != 0 {
+		t.Fatalf("DVLevel = %d, want omitted", got)
+	}
+}
+
 func TestPlanPlaybackV3Profile7StripFallsBackToValidatedHLSCopy(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].DVProfile = 7
@@ -1386,6 +1500,24 @@ func TestStartRequestV3ValidationBoundsInnerLists(t *testing.T) {
 			delivery := r.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
 			delivery.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfiles: make([]int, 17)}
 			r.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+		}},
+		{"capability_dolby_vision_profile_levels", func(r *StartRequestV3) {
+			r.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfileLevels: make([]DolbyVisionProfileCapabilityV3, 17)}
+		}},
+		{"invalid_dolby_vision_profile_level", func(r *StartRequestV3) {
+			r.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{Profile: 8, MaxLevel: 14}}}
+		}},
+		{"duplicate_dolby_vision_profile_level", func(r *StartRequestV3) {
+			r.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{Profile: 8, MaxLevel: 6}, {Profile: 8, MaxLevel: 7}}}
+		}},
+		{"dolby_vision_bl_compatibility_count", func(r *StartRequestV3) {
+			r.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{Profile: 8, MaxLevel: 6, BLCompatibilityIDs: make([]int, 17)}}}
+		}},
+		{"invalid_dolby_vision_bl_compatibility_id", func(r *StartRequestV3) {
+			r.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{Profile: 8, MaxLevel: 6, BLCompatibilityIDs: []int{16}}}}
+		}},
+		{"duplicate_dolby_vision_bl_compatibility_id", func(r *StartRequestV3) {
+			r.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{Profile: 8, MaxLevel: 6, BLCompatibilityIDs: []int{1, 1}}}}
 		}},
 		{"delivery_container_length", func(r *StartRequestV3) {
 			delivery := r.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
