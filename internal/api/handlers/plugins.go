@@ -18,6 +18,7 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 	"github.com/Silo-Server/silo-server/internal/plugins"
@@ -267,13 +268,14 @@ type pluginAdminFormSectionJSON struct {
 }
 
 type pluginCapabilityJSON struct {
-	Type          string                   `json:"type"`
-	ID            string                   `json:"id"`
-	DisplayName   string                   `json:"display_name"`
-	Description   string                   `json:"description"`
-	Subscriptions []string                 `json:"subscriptions,omitempty"`
-	ConfigSchema  []pluginConfigSchemaJSON `json:"config_schema,omitempty"`
-	Metadata      map[string]any           `json:"metadata,omitempty"`
+	Type                  string                   `json:"type"`
+	ID                    string                   `json:"id"`
+	DisplayName           string                   `json:"display_name"`
+	Description           string                   `json:"description"`
+	Subscriptions         []string                 `json:"subscriptions,omitempty"`
+	ConfigSchema          []pluginConfigSchemaJSON `json:"config_schema,omitempty"`
+	Metadata              map[string]any           `json:"metadata,omitempty"`
+	ManagedRolesAvailable bool                     `json:"managed_roles_available"`
 }
 
 type pluginRouteJSON struct {
@@ -1690,13 +1692,14 @@ func capabilitiesToJSON(descriptors []*pluginv1.CapabilityDescriptor) []pluginCa
 			continue
 		}
 		response = append(response, pluginCapabilityJSON{
-			Type:          descriptor.GetType(),
-			ID:            descriptor.GetId(),
-			DisplayName:   descriptor.GetDisplayName(),
-			Description:   descriptor.GetDescription(),
-			Subscriptions: append([]string(nil), descriptor.GetSubscriptions()...),
-			ConfigSchema:  configSchemasToJSON(descriptor.GetConfigSchema()),
-			Metadata:      structToMap(descriptor.GetMetadata()),
+			Type:                  descriptor.GetType(),
+			ID:                    descriptor.GetId(),
+			DisplayName:           descriptor.GetDisplayName(),
+			Description:           descriptor.GetDescription(),
+			Subscriptions:         append([]string(nil), descriptor.GetSubscriptions()...),
+			ConfigSchema:          configSchemasToJSON(descriptor.GetConfigSchema()),
+			Metadata:              structToMap(descriptor.GetMetadata()),
+			ManagedRolesAvailable: auth.CapabilitySupportsManagedRoles(descriptor),
 		})
 	}
 	return response

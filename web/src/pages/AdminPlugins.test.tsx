@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PluginCatalogEntry, PluginInstallation } from "@/api/types";
 
@@ -105,6 +106,23 @@ vi.mock("@/components/ui/switch", () => ({
   },
 }));
 
+vi.mock("@/components/ui/accordion", () => ({
+  Accordion: (props: Record<string, unknown>) => props.children,
+  AccordionContent: (props: Record<string, unknown>) => props.children,
+  AccordionItem: (props: Record<string, unknown>) => props.children,
+  AccordionTrigger: (props: Record<string, unknown>) => props.children,
+}));
+
+vi.mock("@/components/ui/dialog", () => ({
+  Dialog: (props: Record<string, unknown>) => props.children,
+  DialogContent: (props: Record<string, unknown>) => props.children,
+  DialogHeader: (props: Record<string, unknown>) => props.children,
+  DialogTitle: (props: Record<string, unknown>) => props.children,
+  DialogDescription: (props: Record<string, unknown>) => props.children,
+  DialogFooter: (props: Record<string, unknown>) => props.children,
+  DialogClose: (props: Record<string, unknown>) => props.children,
+}));
+
 vi.mock("@tanstack/react-query", async () => {
   const actual =
     await vi.importActual<typeof import("@tanstack/react-query")>("@tanstack/react-query");
@@ -132,6 +150,7 @@ vi.mock("@/hooks/queries/admin/plugins", () => ({
   useApplyPluginUpdate: () => ({ mutate: vi.fn(), isPending: false }),
   useDeletePluginInstallation: () => ({ mutate: vi.fn(), isPending: false }),
   useSavePluginConfig: () => ({ mutate: vi.fn(), isPending: false }),
+  useTestPluginConfig: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useSavePluginAuthBinding: () => ({ mutate: vi.fn(), isPending: false }),
   useSavePluginTaskBinding: () => ({ mutate: vi.fn(), isPending: false }),
 }));
@@ -141,6 +160,10 @@ vi.mock("@/hooks/queries/admin/tasks", () => ({
 }));
 
 describe("AdminPlugins", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
   beforeEach(() => {
     capturedButtonProps.length = 0;
     capturedSwitchProps.length = 0;
@@ -461,5 +484,100 @@ describe("AdminPlugins", () => {
     expect(markup).toContain("Showing");
     expect(markup).toContain(">13</span>–<span");
     expect(markup).toContain("2 / 2");
+  });
+
+  it("shows the managed roles switch for an SDK-contract auth capability", async () => {
+    const installation = makeInstallation(1, "LDAP Auth");
+    installation.capabilities = [
+      {
+        type: "auth_provider.v1",
+        id: "ldap",
+        display_name: "LDAP",
+        description: "Sign in with an LDAP directory account.",
+        managed_roles_available: true,
+      },
+    ];
+    installation.auth_bindings = [
+      {
+        capability_id: "ldap",
+        enabled: true,
+        display_order: 1,
+        auto_provision: true,
+        default_login: false,
+        managed_roles_enabled: false,
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+      },
+    ];
+    useAdminPluginsMock.mockReturnValue({
+      repositories: [],
+      catalog: [],
+      catalogSettings: undefined,
+      isLoading: false,
+      installations: [installation],
+    });
+
+    render(
+      <MemoryRouter>
+        <AdminPlugins />
+      </MemoryRouter>,
+    );
+
+    const configure = capturedButtonProps.find((props) => {
+      const children = props.children;
+      if (typeof children === "string") {
+        return children === "Configure";
+      }
+      return Array.isArray(children) && children.some((child) => child === "Configure");
+    });
+    expect(configure).toBeTruthy();
+    act(() => {
+      (configure?.onClick as () => void)();
+    });
+
+    expect(await screen.findByText("Allow managed Silo roles")).toBeTruthy();
+    expect(
+      screen.getByText("Let this provider promote and demote Silo administrators."),
+    ).toBeTruthy();
+  });
+
+  it("hides the managed roles switch when the SDK contract is not advertised", async () => {
+    const installation = makeInstallation(1, "LDAP Auth");
+    installation.capabilities = [
+      {
+        type: "auth_provider.v1",
+        id: "ldap",
+        display_name: "LDAP",
+        description: "Sign in with an LDAP directory account.",
+      },
+    ];
+    useAdminPluginsMock.mockReturnValue({
+      repositories: [],
+      catalog: [],
+      catalogSettings: undefined,
+      isLoading: false,
+      installations: [installation],
+    });
+
+    render(
+      <MemoryRouter>
+        <AdminPlugins />
+      </MemoryRouter>,
+    );
+
+    const configure = capturedButtonProps.find((props) => {
+      const children = props.children;
+      if (typeof children === "string") {
+        return children === "Configure";
+      }
+      return Array.isArray(children) && children.some((child) => child === "Configure");
+    });
+    expect(configure).toBeTruthy();
+    act(() => {
+      (configure?.onClick as () => void)();
+    });
+
+    expect(await screen.findByText("Auth Providers")).toBeTruthy();
+    expect(screen.queryByText("Allow managed Silo roles")).toBeNull();
   });
 });

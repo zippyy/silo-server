@@ -86,6 +86,28 @@ func ManagedRoleContractForBinding(metadata map[string]any, enabled bool) (strin
 	return contract, nil
 }
 
+// CapabilitySupportsManagedRoles reports whether the capability advertises a
+// usable managed-role contract, either the SDK descriptor (auth_provider
+// managed_roles) or the legacy v1 metadata contract. It deliberately reuses
+// the same validators the auth decision path relies on so the value surfaced
+// to callers (for example the admin UI's "Allow managed Silo roles" switch)
+// can never disagree with what the server will actually authorize.
+func CapabilitySupportsManagedRoles(descriptor *pluginv1.CapabilityDescriptor) bool {
+	if descriptor == nil {
+		return false
+	}
+	if _, err := ManagedRoleDescriptorFromCapability(descriptor); err == nil {
+		if descriptor.GetAuthProvider().GetManagedRoles() != nil {
+			return true
+		}
+	}
+	if descriptor.GetMetadata() == nil {
+		return false
+	}
+	contract, err := ManagedRoleContractFromMetadata(descriptor.GetMetadata().AsMap())
+	return err == nil && contract != ""
+}
+
 func managedRoleFromResponse(
 	response *pluginv1.AuthenticateResponse,
 	advertisedSDKRoles *pluginv1.AuthProviderManagedRoleDescriptor,

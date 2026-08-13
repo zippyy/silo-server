@@ -618,8 +618,9 @@ function ConfigureDialog({
                             }
                           />
                         </div>
-                        {capability.metadata?.managed_role_contract ===
-                          "silo.auth.managed-role.v1" && (
+                        {(capability.managed_roles_available ||
+                          capability.metadata?.managed_role_contract ===
+                            "silo.auth.managed-role.v1") && (
                           <div className="flex items-center justify-between border-t pt-3">
                             <div className="pr-4">
                               <p className="text-sm font-medium">Allow managed Silo roles</p>

@@ -3514,6 +3514,7 @@ export interface PluginCapability {
   subscriptions?: string[];
   config_schema?: PluginConfigSchema[];
   metadata?: Record<string, unknown>;
+  managed_roles_available?: boolean;
 }
 
 export interface PluginRoute {

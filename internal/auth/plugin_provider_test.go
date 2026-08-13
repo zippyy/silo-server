@@ -59,6 +59,65 @@ func TestManagedRoleContractFromMetadata(t *testing.T) {
 	}
 }
 
+func TestCapabilitySupportsManagedRoles(t *testing.T) {
+	sdkDescriptor := func(roles ...pluginv1.ManagedSiloRole) *pluginv1.CapabilityDescriptor {
+		return &pluginv1.CapabilityDescriptor{
+			AuthProvider: &pluginv1.AuthProviderDescriptor{
+				ManagedRoles: &pluginv1.AuthProviderManagedRoleDescriptor{
+					SupportedRoles: roles,
+				},
+			},
+		}
+	}
+	legacyDescriptor := func(contract string, roles []any) *pluginv1.CapabilityDescriptor {
+		values := map[string]any{}
+		if contract != "" {
+			values[managedRoleContractMetadataKey] = contract
+		}
+		if roles != nil {
+			values[managedRoleValuesMetadataKey] = roles
+		}
+		metadata, err := structpb.NewStruct(values)
+		if err != nil {
+			t.Fatalf("structpb.NewStruct() error = %v", err)
+		}
+		return &pluginv1.CapabilityDescriptor{Metadata: metadata}
+	}
+
+	tests := []struct {
+		name       string
+		descriptor *pluginv1.CapabilityDescriptor
+		want       bool
+	}{
+		{name: "nil descriptor", descriptor: nil, want: false},
+		{name: "no auth provider", descriptor: &pluginv1.CapabilityDescriptor{}, want: false},
+		{name: "no managed roles advertised", descriptor: sdkDescriptor(), want: false},
+		{name: "sdk descriptor with user and admin", descriptor: sdkDescriptor(
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
+		), want: true},
+		{name: "sdk descriptor with a single role", descriptor: sdkDescriptor(
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+		), want: false},
+		{name: "sdk descriptor with unsupported role", descriptor: sdkDescriptor(
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_USER,
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_ADMIN,
+			pluginv1.ManagedSiloRole_MANAGED_SILO_ROLE_UNSPECIFIED,
+		), want: false},
+		{name: "legacy v1 contract", descriptor: legacyDescriptor(ManagedRoleContractV1, []any{"user", "admin"}), want: true},
+		{name: "legacy unsupported version", descriptor: legacyDescriptor("silo.auth.managed-role.v2", []any{"user", "admin"}), want: false},
+		{name: "legacy missing values", descriptor: legacyDescriptor(ManagedRoleContractV1, nil), want: false},
+		{name: "empty descriptor metadata", descriptor: legacyDescriptor("", nil), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := CapabilitySupportsManagedRoles(test.descriptor); got != test.want {
+				t.Fatalf("CapabilitySupportsManagedRoles() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestManagedRoleContractForBindingRequiresOperatorAuthorization(t *testing.T) {
 	metadata := map[string]any{
 		managedRoleContractMetadataKey: ManagedRoleContractV1,
