@@ -23,6 +23,9 @@ export interface CatalogSearchState {
   person_id?: string;
   type_override?: string;
   uses_source_order?: boolean;
+  // True when the UI is displaying a collection sort resolved by the server,
+  // rather than an explicit sort read from the URL or chosen by the viewer.
+  sort_from_server?: boolean;
   query_definition: QueryDefinition;
 }
 
@@ -385,6 +388,7 @@ export function buildCatalogApiSearchParams(state: CatalogSearchState): URLSearc
     params.set("order", state.query_definition.sort.order);
   } else if (
     !state.uses_source_order &&
+    !state.sort_from_server &&
     state.query_definition.sort.field &&
     (state.query_definition.sort.field !== "added_at" ||
       (state.source === "query" && effectiveLibraryID != null) ||

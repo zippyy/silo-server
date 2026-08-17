@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 18
+const schemaVersion = 19
 
 func runMigrations(db *sql.DB) error {
 	version, err := userVersion(db)
@@ -178,7 +178,26 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	if version < 19 {
+		if err := migrateToV19(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 19"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 19: %w", err)
+		}
+	}
+
 	return tx.Commit()
+}
+
+// migrateToV19 adds the per-profile collection sort override table. An empty
+// sort_field is a real choice ("keep this collection's own source order") and
+// is distinct from having no row.
+func migrateToV19(tx *sql.Tx) error {
+	if _, err := tx.Exec(collectionSortPreferencesSchema); err != nil {
+		return fmt.Errorf("creating collection_sort_preferences: %w", err)
+	}
+	return nil
 }
 
 // migrateToV18 seeds the family-neutral navigation shortcut catalog from the

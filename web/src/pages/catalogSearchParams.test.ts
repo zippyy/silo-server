@@ -252,6 +252,26 @@ describe("buildCatalogHref", () => {
     expect(explicitAddedAt.toString()).toBe("source=watchlist&sort=added_at&order=desc");
   });
 
+  it("does not leak a server-derived collection sort into an unrelated filter update", () => {
+    const built = buildCatalogFilterSearchParams({
+      source: "library_collection",
+      collection_id: "col-7",
+      type_override: "movie",
+      uses_source_order: false,
+      sort_from_server: true,
+      query_definition: {
+        library_ids: [],
+        match: "all",
+        groups: [],
+        sort: { field: "title", order: "asc" },
+      },
+    });
+
+    expect(built.get("type")).toBe("movie");
+    expect(built.has("sort")).toBe(false);
+    expect(built.has("order")).toBe(false);
+  });
+
   it("builds source-ordered personal catalog hrefs without a sort param", () => {
     expect(buildPersonalCatalogHref("watchlist")).toBe("/catalog?source=watchlist");
     expect(buildPersonalCatalogHref("favorites")).toBe("/catalog?source=favorites");

@@ -162,6 +162,11 @@ type UserStore interface {
 	DeleteAudioPreference(ctx context.Context, profileID, seriesID string) error
 	SetSeriesPlaybackPreference(ctx context.Context, pref SeriesPlaybackPreference) error
 	GetSeriesPlaybackPreference(ctx context.Context, profileID, seriesID string) (*SeriesPlaybackPreference, error)
+
+	// Collection sort preferences
+	SetCollectionSortPreference(ctx context.Context, pref CollectionSortPreference) error
+	GetCollectionSortPreference(ctx context.Context, profileID, collectionKind, collectionID string) (*CollectionSortPreference, error)
+	ClearCollectionSortPreference(ctx context.Context, profileID, collectionKind, collectionID string) error
 	DeleteSeriesPlaybackPreference(ctx context.Context, profileID, seriesID string) error
 	GetLibraryPlaybackPreference(ctx context.Context, profileID string, libraryID int) (*LibraryPlaybackPreference, error)
 	ListLibraryPlaybackPreferences(ctx context.Context, profileID string) ([]LibraryPlaybackPreference, error)

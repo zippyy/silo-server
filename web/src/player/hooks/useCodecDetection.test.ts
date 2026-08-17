@@ -60,7 +60,7 @@ describe("probeWebCapabilities", () => {
       expect.objectContaining({
         type: "file",
         video: expect.objectContaining({
-          contentType: 'video/mp4; codecs="hev1.2.4.L153.B0"',
+          contentType: 'video/mp4; codecs="hvc1.2.4.L153.B0"',
           colorGamut: "rec2020",
           transferFunction: "pq",
           hdrMetadataType: "smpteSt2086",
@@ -69,19 +69,39 @@ describe("probeWebCapabilities", () => {
     );
   });
 
-  it("does not probe HDR10 decoding against an SDR output", async () => {
-    const decodingInfo = vi.fn();
+  // The strip remux delivers an hvc1-labeled file; support reported only for
+  // hev1 is evidence for bytes Silo never sends and must not earn the claim.
+  it("does not promote an hev1-only answer to an HDR10 claim", async () => {
+    const decodingInfo = vi.fn().mockImplementation((configuration: MediaDecodingConfiguration) => {
+      const supported = configuration.video?.contentType.includes("hev1") ?? false;
+      return Promise.resolve({ supported, smooth: supported, powerEfficient: supported });
+    });
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo } });
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("high") }));
+
+    await expect(probeHDR10PlaybackSupport()).resolves.toBe(false);
+  });
+
+  // Safari 26 reports `dynamic-range: standard` on XDR panels, and browsers
+  // tone-map HDR onto SDR outputs regardless. Decode evidence stands alone.
+  it("probes HDR10 decoding even when the output reports no HDR", async () => {
+    const decodingInfo = vi.fn().mockResolvedValue({
+      supported: true,
+      smooth: true,
+      powerEfficient: true,
+      keySystemAccess: null,
+    });
     vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo } });
     vi.stubGlobal("matchMedia", () => ({ matches: false }));
 
-    await expect(probeHDR10PlaybackSupport()).resolves.toBe(false);
-    expect(decodingInfo).not.toHaveBeenCalled();
+    await expect(probeHDR10PlaybackSupport()).resolves.toBe(true);
+    expect(decodingInfo).toHaveBeenCalled();
   });
 
-  it("advertises native Dolby Vision Profile 8 only on an HDR output", () => {
+  it("advertises native Dolby Vision Profile 8 from the dvh1 sample entry", () => {
     vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("high") }));
     vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
-      mime === 'video/mp4; codecs="dvhe.08.06"' ? "probably" : "",
+      mime === 'video/mp4; codecs="dvh1.08.06"' ? "probably" : "",
     );
 
     const capabilities = probeWebCapabilities();
@@ -97,48 +117,79 @@ describe("probeWebCapabilities", () => {
     expect(capabilities.progressiveCodecsVideo).toContain("hevc");
   });
 
-  it("does not advertise a Dolby Vision decoder against an SDR output", () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: false }));
-    const canPlayType = vi
-      .spyOn(HTMLMediaElement.prototype, "canPlayType")
-      .mockImplementation((mime) => (mime === 'video/mp4; codecs="dvhe.08.06"' ? "probably" : ""));
-
-    const capabilities = probeWebCapabilities();
-
-    expect(capabilities.hdrDetails.dolby_vision_profiles).toEqual([]);
-    expect(capabilities.hdrDetails.dolby_vision_profile_levels).toEqual([]);
-    expect(canPlayType).not.toHaveBeenCalledWith('video/mp4; codecs="dvhe.08.06"');
-  });
-
-  it("does not promote an indeterminate media-element answer to Dolby Vision support", () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+  // The preserve remux tags its output dvh1; a browser that answers only for
+  // dvhe has given no evidence for that file and must not earn the claim.
+  it("does not promote a dvhe-only answer to a Dolby Vision claim", () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("high") }));
     vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
-      mime === 'video/mp4; codecs="dvhe.08.06"' ? "maybe" : "",
+      mime === 'video/mp4; codecs="dvhe.08.06"' ? "probably" : "",
     );
 
     expect(probeWebCapabilities().hdrDetails.dolby_vision_profiles).toEqual([]);
   });
 
-  it("refreshes Dolby Vision claims when the active HDR output changes", () => {
-    let hdr = false;
+  // The generic media query describes the output, not the decoder. Safari 26
+  // reports no HDR on an XDR display while answering "probably" for dvh1.
+  it("keeps a definitive Dolby Vision answer from an output reporting no HDR", () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false }));
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      mime === 'video/mp4; codecs="dvh1.08.06"' ? "probably" : "",
+    );
+
+    const capabilities = probeWebCapabilities();
+
+    expect(capabilities.hdr).toBe(false);
+    expect(capabilities.hdrDetails.dolby_vision_profiles).toEqual([8]);
+    expect(capabilities.hdrDetails.dolby_vision_profile_levels).toEqual([
+      { profile: 8, max_level: 6, bl_compatibility_ids: [1] },
+    ]);
+  });
+
+  it("does not promote an indeterminate media-element answer to Dolby Vision support", () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      mime.startsWith('video/mp4; codecs="dv') ? "maybe" : "",
+    );
+
+    expect(probeWebCapabilities().hdrDetails.dolby_vision_profiles).toEqual([]);
+  });
+
+  // `screen` is measured in logical CSS pixels, so a 2x MacBook Pro XDR panel
+  // advertises 1080p unless the device pixel ratio is applied.
+  it("scales the screen-derived resolution by the device pixel ratio", () => {
+    vi.stubGlobal("screen", { width: 1728, height: 1117 });
+    vi.stubGlobal("devicePixelRatio", 2);
+
+    expect(probeWebCapabilities().maxResolution).toBe("2160p");
+  });
+
+  it("treats a missing device pixel ratio as 1", () => {
+    vi.stubGlobal("screen", { width: 1728, height: 1117 });
+    vi.stubGlobal("devicePixelRatio", undefined);
+
+    expect(probeWebCapabilities().maxResolution).toBe("1080p");
+  });
+
+  // Moving a window between displays can change what the decoder will admit to,
+  // so the media-query listeners still drive a re-probe.
+  it("re-probes Dolby Vision claims when the active output changes", () => {
+    let decodes = false;
     const listeners = new Set<() => void>();
     const query = {
-      get matches() {
-        return hdr;
-      },
+      matches: false,
       addEventListener: (_: string, listener: () => void) => listeners.add(listener),
       removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
     };
     vi.stubGlobal("matchMedia", () => query);
     vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
-      mime === 'video/mp4; codecs="dvhe.08.06"' ? "probably" : "",
+      decodes && mime === 'video/mp4; codecs="dvh1.08.06"' ? "probably" : "",
     );
 
     const { result, unmount } = renderHook(() => useCodecDetection());
     expect(result.current.hdrDetails.dolby_vision_profiles).toEqual([]);
 
     act(() => {
-      hdr = true;
+      decodes = true;
       for (const listener of listeners) listener();
     });
     expect(result.current.hdrDetails.dolby_vision_profiles).toEqual([8]);
@@ -147,8 +198,9 @@ describe("probeWebCapabilities", () => {
 
   it("refreshes the active capabilities after the async HDR10 probe", async () => {
     const listeners = new Set<() => void>();
+    // The output reports no HDR: the decode probe must still run and be trusted.
     const query = {
-      matches: true,
+      matches: false,
       addEventListener: (_: string, listener: () => void) => listeners.add(listener),
       removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
     };

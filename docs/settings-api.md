@@ -48,6 +48,38 @@ the other. Send the exact lower-case family:
 | macOS                   | `desktop` |
 | Browser                 | `web`     |
 
+### App identity headers
+
+Separately from the family, every first-party client should send its own app
+identity on playback requests. These are server-wide contextual headers, not
+settings-specific: the playback session stores them, the admin Activity page
+renders them ("Silo Android TV 1.0.0 (build 5)"), and playback decision logs
+carry them so a report can be tied to an exact build.
+
+| Header                  | Clamp | Meaning                                                                                                       |
+| ----------------------- | ----- | ------------------------------------------------------------------------------------------------------------- |
+| `X-Silo-Client`         | 128   | Product name, e.g. `Silo Android TV`, `Silo iOS`.                                                             |
+| `X-Silo-Client-Version` | 64    | Marketing version, e.g. `1.0.0`. Sent verbatim and displayed verbatim — do not pre-shorten it.                 |
+| `X-Silo-Client-Build`   | 64    | Opaque per-platform build identifier (Android `versionCode`, Apple `CFBundleVersion`). Never parsed or compared. |
+| `X-Silo-Client-Channel` | 32    | Opaque distribution channel: `release`, `beta`, `sideload`, `dev`. Stored verbatim; `release` is not displayed.  |
+
+Values are trimmed and truncated to the clamp above — never rejected, on either
+route, because an identity label must not be able to fail a playback start. The
+clamp counts characters, not bytes, matching `maxLength` in the v3 request
+schemas, and is applied where the request is read rather than where the session
+is created so the decision logs and `playback_route_events` observe it too.
+Nothing is validated against an enum either, so a client may introduce a new
+channel without a server change.
+
+Protocol-v3 `POST /playback/start` accepts `client_playback_context.app_version`,
+`.app_build`, and `.app_channel` as a body-level fallback for clients that cannot
+set the headers on every request. The headers win field by field when both are
+present, and the fallback applies **only to a client that sent `X-Silo-Client`**:
+`client_playback_context` carries no app name, so nothing in the body can
+identify a client that did not name itself — such a session is labeled from its
+user agent, and its `app_version` is a free-form platform string rather than the
+marketing version `client_version` promises.
+
 ## Remote scopes
 
 Every stored value has exactly one identity. Context fields not named by the

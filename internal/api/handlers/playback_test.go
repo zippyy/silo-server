@@ -167,6 +167,10 @@ func (failingSessionManager) StartSessionWithFiles(int, string, int, int, playba
 	return nil, errors.New("boom")
 }
 
+func (failingSessionManager) StartSessionWithFilesContext(context.Context, int, string, int, int, playback.PlayMethod, bool) (*playback.Session, error) {
+	return nil, errors.New("boom")
+}
+
 func (failingSessionManager) UpdateProgress(string, float64, bool) error { return nil }
 
 func (failingSessionManager) UpdateAudioTrack(string, int, playback.PlayMethod) error { return nil }
@@ -180,6 +184,8 @@ func (failingSessionManager) TouchActivity(string) error { return nil }
 func (failingSessionManager) BeginTransport(string) error { return nil }
 
 func (failingSessionManager) EndTransport(string) error { return nil }
+
+func (failingSessionManager) SetRemoteTransport(string, bool) error { return nil }
 
 func (failingSessionManager) SetEffectiveMediaFileID(string, int) error { return nil }
 

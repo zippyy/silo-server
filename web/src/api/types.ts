@@ -864,6 +864,13 @@ export interface CatalogResponse extends BrowseResponse {
   source?: CatalogSource;
   title?: string;
   snapshot?: string;
+  /**
+   * The order a collection source actually resolved in, after the viewer's
+   * saved override and the collection's configured default were applied.
+   * Absent for non-collection sources and when the collection kept its own
+   * source order.
+   */
+  effective_sort?: QuerySort;
 }
 
 export interface ItemFiltersResponse {
@@ -1374,6 +1381,9 @@ export interface CollectionCapabilitiesResponse {
     watched: UserCollectionWatchFilter[];
     media: UserCollectionMediaFilter[];
   };
+  collection_default_sort?: boolean;
+  collection_sort_preferences?: boolean;
+  effective_collection_sort?: boolean;
 }
 
 export interface QueryRule {
@@ -1390,6 +1400,18 @@ export interface QueryGroup {
 export interface DisplayQueryDefinition {
   match: "all" | "any";
   groups: QueryGroup[];
+}
+
+/**
+ * A collection's default sort. An empty object (or an absent field) means the
+ * collection keeps the order its source supplied.
+ */
+export interface CollectionSortConfig {
+  field?: string;
+  order?: "asc" | "desc";
+  // Index signature keeps this assignable to the `Record<string, unknown>`
+  // sort_config fields on the collection request types, which predate it.
+  [key: string]: unknown;
 }
 
 export interface QuerySort {
@@ -1643,6 +1665,8 @@ export interface ImportMDBListCollectionRequest {
   management_mode?: LibraryCollectionManagementMode;
   management_source?: string;
   management_key?: string;
+  /** Default order viewers land on; `{}` keeps the source list's own order. */
+  sort_config?: CollectionSortConfig;
 }
 
 export interface ImportMDBListCollectionResponse {
@@ -1674,6 +1698,8 @@ export interface ImportTMDBCollectionRequest {
   management_mode?: LibraryCollectionManagementMode;
   management_source?: string;
   management_key?: string;
+  /** Default order viewers land on; `{}` keeps the source list's own order. */
+  sort_config?: CollectionSortConfig;
 }
 
 export interface ImportTMDBCollectionResponse {
@@ -1701,6 +1727,8 @@ export interface ImportTraktCollectionRequest {
   management_mode?: LibraryCollectionManagementMode;
   management_source?: string;
   management_key?: string;
+  /** Default order viewers land on; `{}` keeps the source list's own order. */
+  sort_config?: CollectionSortConfig;
 }
 
 export interface ImportTraktCollectionResponse {
@@ -1724,6 +1752,8 @@ export interface UserImportSharedFields {
   display_query_definition?: DisplayQueryDefinition;
   /** Restrict resolution to these libraries; omitted/empty = entire catalog the user can see. */
   library_ids?: number[];
+  /** Default order viewers land on; `{}` keeps the source list's own order. */
+  sort_config?: CollectionSortConfig;
 }
 
 export interface ImportUserMDBListCollectionRequest extends UserImportSharedFields {
@@ -2445,7 +2475,10 @@ export interface AdminSession {
   client_ip?: string;
   client_name?: string;
   client_version?: string;
+  client_build?: string;
+  client_channel?: string;
   client_label?: string;
+  client_label_full?: string;
   client_user_agent?: string;
   audio_track_index: number;
   transcode_audio: boolean;

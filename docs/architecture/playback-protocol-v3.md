@@ -382,13 +382,21 @@ Refusing to play those outright would be worse than an assumption the client is
 told about.
 
 The web client does not promote the generic high-dynamic-range media query to a
-format claim by itself. It combines that active-output signal with Media
-Capabilities support for Silo's progressive 2160p HEVC Main10, Rec. 2020, PQ,
-SMPTE ST 2086 shape before advertising HDR10. Dolby Vision likewise requires a
-definitive media-element answer for the exact `dvhe.05.06` or `dvhe.08.06`
-sample entry. Both claims are scoped to `progressive`: they are cleared from
-`original_http` and `hls` because those delivery paths were not tested by the
-same probe. An HDR10 claim can carry `hdr10_max_width`, `hdr10_max_height`,
+format claim, and it does not gate format claims on it either. Decoder capability
+and active-output HDR are separate facts — browsers tone-map HDR content onto SDR
+outputs, and Safari 26 reports `dynamic-range: standard` even on an XDR display —
+so the media query survives only as the best-effort `hdr` output boolean. Format
+claims come from exact shape probes matched to the bytes the remux delivers:
+HDR10 requires Media Capabilities support for Silo's progressive 2160p HEVC
+Main10, Rec. 2020, PQ, SMPTE ST 2086 shape, probed under exactly the `hvc1`
+sample entry because the explicit v3 HDR10 strip remux labels its output `hvc1`
+(legacy and automatic strip paths retain FFmpeg's default `hev1`). Dolby Vision
+requires a definitive media-element answer for exactly `dvh1.05.06` or
+`dvh1.08.06`, because the preserve remux tags its output `dvh1`. An answer only
+for the other spelling (`hev1`/`dvhe`) is evidence for a file Silo never sends
+and earns no claim. Both claims are scoped to `progressive`: they
+are cleared from `original_http` and `hls` because those delivery paths were not
+tested by the same probe. An HDR10 claim can carry `hdr10_max_width`, `hdr10_max_height`,
 `hdr10_max_frame_rate`, and `hdr10_max_bitrate_kbps`; these ceilings keep a
 successful format probe from admitting an untested stream class.
 
@@ -612,7 +620,10 @@ help. Delivered inside a `201` (start) or `200` (replan), never a 4xx.
 `source_metadata_incomplete`, `source_unavailable`,
 `audio_conversion_unsupported`, `video_conversion_unsupported`,
 `dv_conversion_unsupported`, `transcoding_disabled`,
-`subtitle_conversion_unsupported`.
+`subtitle_conversion_unsupported`. When a video adaptation is forced solely by a
+subtitle burn-in requirement and cannot execute, the terminal is
+`subtitle_conversion_unsupported` naming the subtitle rather than the underlying
+HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playback.
 
 *Subtitle policy:* `subtitle_burn_in_source_unsupported`,
 `subtitle_codec_unsupported`, `subtitle_track_invalid`,

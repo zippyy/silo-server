@@ -124,6 +124,18 @@ CREATE TABLE IF NOT EXISTS personal_collections (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS collection_sort_preferences (
+    profile_id TEXT NOT NULL,
+    collection_kind TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    sort_field TEXT NOT NULL DEFAULT '',
+    sort_order TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, collection_kind, collection_id),
+    CHECK (collection_kind IN ('library', 'user')),
+    CHECK (sort_order IN ('', 'asc', 'desc'))
+);
+
 CREATE TABLE IF NOT EXISTS personal_collection_items (
     collection_id TEXT NOT NULL,
     media_item_id TEXT NOT NULL,
@@ -494,6 +506,22 @@ CREATE INDEX user_setting_values_library_idx
 	}
 	return nil
 }
+
+// collectionSortPreferencesSchema is kept as its own const (rather than only
+// inlined in Schema) so migrateToV19 can create the table on databases that
+// predate it. collection_kind separates the 'library' and 'user' id spaces.
+const collectionSortPreferencesSchema = `
+CREATE TABLE IF NOT EXISTS collection_sort_preferences (
+    profile_id TEXT NOT NULL,
+    collection_kind TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    sort_field TEXT NOT NULL DEFAULT '',
+    sort_order TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, collection_kind, collection_id),
+    CHECK (collection_kind IN ('library', 'user')),
+    CHECK (sort_order IN ('', 'asc', 'desc'))
+);`
 
 // watchProgressSyncTriggers stamps the server-owned cursor (synced_seq) on every
 // watch_progress write and owns the LWW key: event_at defaults to the write

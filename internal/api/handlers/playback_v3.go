@@ -199,6 +199,12 @@ type transcodeNodeEnumeratorV3 interface {
 	TranscodeNodeURLs() []string
 }
 
+// proxyNodeEnumeratorV3 is the proxy-pool counterpart, letting identity
+// planning narrow selection to proxies that can execute the plan's recipe.
+type proxyNodeEnumeratorV3 interface {
+	ProxyNodeURLs() []string
+}
+
 // hlsPlanningRegistryV3 returns the registry HLS deliveries plan against: the
 // local probe plus every pooled transcode node's advertised transformations.
 // Only availability of locally-defined specs widens (name and recipe version
@@ -452,20 +458,25 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 		}
 	}
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), result.Terminal, requestedFile, !shouldTryAlternateFileV3(req.QualityPreference))
+	// The exact app identity is logged with every decision so a route or
+	// terminal reported against one build is attributable without asking the
+	// user which version they are running.
+	clientInfo := playbackClientInfoForStartV3(r, req.ClientPlaybackContext)
 	if result.Terminal != nil {
-		slog.InfoContext(r.Context(), "playback plan decided", "component", "playback",
+		slog.InfoContext(r.Context(), "playback plan decided", append([]any{
+			logComponentKey, "playback",
 			"outcome", "terminal",
 			"reason", result.Terminal.Reason,
 			"file_id", effectiveFile.ID,
 			"quality_preference", req.QualityPreference,
-		)
+		}, clientInfo.LogAttrs()...)...)
 		response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, playback.NewTerminalResponseV3(result.Terminal.Reason, result.Terminal.Message, result.Terminal.Retryable))
 		if persistErr != nil {
 			writeStartAttemptPersistenceErrorV3(w, persistErr)
 			return
 		}
 		if response.Terminal != nil {
-			h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, Event: playback.RouteEventTerminalV3, FallbackReason: response.Terminal.Reason, OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: playbackClientInfoFromRequest(r).Name, ClientVersion: playbackClientInfoFromRequest(r).Version, ClientModel: req.ClientPlaybackContext.Device.Model})
+			h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, Event: playback.RouteEventTerminalV3, FallbackReason: response.Terminal.Reason, OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 		}
 		writeJSON(w, http.StatusCreated, response)
 		return
@@ -473,7 +484,8 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	// One line per plan decision so route selection is reconstructible from
 	// server logs alone (finding a mis-planned route previously required
 	// correlating client logcat, ffmpeg commands, and session rows).
-	slog.InfoContext(r.Context(), "playback plan decided", "component", "playback",
+	slog.InfoContext(r.Context(), "playback plan decided", append([]any{
+		logComponentKey, "playback",
 		"outcome", "plan",
 		"decision_reason", result.Plan.DecisionReason,
 		"delivery", result.Plan.Delivery,
@@ -486,9 +498,9 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 		"target_bitrate_kbps", result.TargetBitrateKbps,
 		"quality_preference", req.QualityPreference,
 		"bandwidth_estimate_kbps", intOrZeroHandlerV3(req.BandwidthEstimateKbps),
-	)
+	}, clientInfo.LogAttrs()...)...)
 	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warnings...)
-	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, result)
+	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, result, clientInfo)
 	if statusErr != nil {
 		if statusErr.reason == "playback_attempt_reused" {
 			writeError(w, http.StatusConflict, "playback_attempt_reused", statusErr.message)
@@ -513,6 +525,70 @@ type playbackStartRequestDigestsV3 struct {
 	legacy  string
 }
 
+// playbackClientInfoForStartV3 resolves the client's app identity for a v3
+// start request. The X-Silo-Client-* headers win because they are present on
+// every request; the start body's client_playback_context is the fallback for
+// clients that report their app identity only there. All values stay opaque —
+// they are trimmed and length-clamped when the session stamps them.
+//
+// The fallback applies only to a client that named itself. client_playback_context
+// carries no app name, so nothing in the body can identify a nameless client
+// anyway — it is labeled from its user agent, and its app_version is a
+// free-form platform string rather than the marketing version client_version
+// promises. The web player, for one, reports the literal "web" there; taking it
+// unconditionally would write "web" into the one field that is contractually
+// semver, on every browser session.
+func playbackClientInfoForStartV3(r *http.Request, clientContext playback.ClientPlaybackContextV3) playback.ClientInfo {
+	info := playbackClientInfoFromRequest(r)
+	if info.Name == "" {
+		return info
+	}
+	if info.Version == "" {
+		info.Version = strings.TrimSpace(clientContext.AppVersion)
+	}
+	if info.Build == "" {
+		info.Build = strings.TrimSpace(clientContext.AppBuild)
+	}
+	if info.Channel == "" {
+		info.Channel = strings.TrimSpace(clientContext.AppChannel)
+	}
+	// The header half is already normalized; body-sourced values have to be
+	// clamped too before they reach the decision log and the route event.
+	return info.Normalized()
+}
+
+// playbackClientInfoWithSessionFallbackV3 completes a header-derived identity
+// from the session the event belongs to. Route events posted out of band carry
+// no client_playback_context, so without this a client that reports its build
+// only in the start body would attribute its plan_selected event to a build and
+// every later event of the same attempt to none.
+func (h *PlaybackHandler) playbackClientInfoWithSessionFallbackV3(sessionID string, info playback.ClientInfo) playback.ClientInfo {
+	if sessionID == "" || h.sessionMgr == nil {
+		return info
+	}
+	if info.Name != "" && info.Version != "" && info.Build != "" && info.Channel != "" {
+		return info
+	}
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil || session == nil {
+		return info
+	}
+	stamped := session.ClientInfo()
+	if info.Name == "" {
+		info.Name = stamped.Name
+	}
+	if info.Version == "" {
+		info.Version = stamped.Version
+	}
+	if info.Build == "" {
+		info.Build = stamped.Build
+	}
+	if info.Channel == "" {
+		info.Channel = stamped.Channel
+	}
+	return info
+}
+
 // newPlaybackStartRequestDigestsV3 fingerprints both the body and normalized
 // device identity because either can change the selected playback plan. It
 // also retains the pre-device digest while attempts written by an older
@@ -533,7 +609,7 @@ func (d playbackStartRequestDigestsV3) matches(stored string) bool {
 	return stored == "" || stored == d.current || stored == d.legacy
 }
 
-func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, result playback.PlannerResultV3) (playback.DecisionResponseV3, *transportErrorV3) {
+func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
 	if result.Plan == nil {
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "The server produced no playback plan."}
 	}
@@ -546,15 +622,8 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 			return playback.DecisionResponseV3{}, &transportErrorV3{reason: reason, message: "The selected server adaptation is disabled for this user."}
 		}
 	}
-	clientInfo := playbackClientInfoFromRequest(r)
 	ctx := playback.WithClientInfo(r.Context(), clientInfo)
-	var session *playback.Session
-	var err error
-	if starter, ok := h.sessionMgr.(sessionStarterWithFilesContext); ok {
-		session, err = starter.StartSessionWithFilesContext(ctx, userID, profileID, effectiveFile.ID, requestedFile.ID, result.PlayMethod, result.TranscodeAudio)
-	} else {
-		session, err = h.sessionMgr.StartSessionWithFiles(userID, profileID, effectiveFile.ID, requestedFile.ID, result.PlayMethod, result.TranscodeAudio)
-	}
+	session, err := h.sessionMgr.StartSessionWithFilesContext(ctx, userID, profileID, effectiveFile.ID, requestedFile.ID, result.PlayMethod, result.TranscodeAudio)
 	if err != nil {
 		return playback.DecisionResponseV3{}, sessionStartErrorV3(err)
 	}
@@ -653,7 +722,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	h.maybeQueueLazyPlaybackMarkers(r.Context(), session, effectiveFile)
 	h.persistSeriesSelectionsV3(r.Context(), userID, profileID, effectiveFile, plannedAudioTrackIndexV3(result, audioIndex))
 	h.syncSessionsNow(r.Context(), "v3_start")
-	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientModel: req.ClientPlaybackContext.Device.Model})
+	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 	return response, nil
 }
 
@@ -673,7 +742,7 @@ func (h *PlaybackHandler) prepareTransportV3(r *http.Request, session *playback.
 		return preparedTransportV3{}, timelineErr
 	}
 	if result.Plan.Delivery != playback.DeliveryTranscodeHLSV3 && result.Plan.Delivery != playback.DeliveryRemuxHLSV3 {
-		return h.prepareIdentityTransportV3(session, result, timeline), nil
+		return h.prepareIdentityTransportV3(r, session, file, result, timeline)
 	}
 	if h.NodePlanner != nil {
 		plan := h.planNodeSessionV3(r.Context(), session, result)
@@ -778,7 +847,7 @@ func planRequiresServerTransformationsV3(plan *playback.PlanV3) bool {
 	return false
 }
 
-func (h *PlaybackHandler) prepareIdentityTransportV3(session *playback.Session, result playback.PlannerResultV3, timeline preparedTimelineV3) preparedTransportV3 {
+func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, timeline preparedTimelineV3) (preparedTransportV3, *transportErrorV3) {
 	routeSession := *session
 	routeSession.PlayMethod = result.PlayMethod
 	routeSession.BasePlayMethod = result.PlayMethod
@@ -789,11 +858,31 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(session *playback.Session, 
 	routeSession.TargetAudioChannels = result.TargetAudioChannels
 	routeSession.TargetAudioBitrateKbps = result.TargetAudioBitrateKbps
 	routeSession.RemuxDVMode = remuxDVModeForPlanV3(result.Plan)
+
+	proxyNode, proxyErr := h.planIdentityProxyV3(r, session.ID, result)
+	if proxyErr != nil {
+		return preparedTransportV3{}, proxyErr
+	}
+	streamURL, servedByProxy := h.identityStreamURLV3(&routeSession, file, proxyNode)
+	releaseProxyReservation := func() {
+		if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
+			releaser.ReleaseSession(session.ID)
+		}
+	}
+	if proxyNode != nil && !servedByProxy {
+		// A planned proxy that could not be addressed (no signable token, no
+		// file record) falls back to the local path, so its reservation must be
+		// dropped now rather than pinning that node's budget until it ages out.
+		releaseProxyReservation()
+		if err := h.refuseLocalIdentityWorkV3(r, result); err != nil {
+			return preparedTransportV3{}, err
+		}
+	}
+
 	previousNodeURL := session.TranscodeNodeURL
 	previousTransportID := remoteTransportID(session)
 	unlock := h.tm.LockSessionLifecycle(session.ID)
 	committed := false
-	streamURL := h.playbackStreamURL(&routeSession)
 	if result.Plan != nil && result.Plan.Delivery == playback.DeliveryRemuxProgressiveV3 {
 		if seek := timeline.seekSeconds; seek > 0 {
 			streamURL = appendPlaybackQueryV3(streamURL, "seek", strconv.FormatFloat(seek, 'f', -1, 64))
@@ -810,6 +899,7 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(session *playback.Session, 
 			if previousNodeURL != "" {
 				h.tm.StopRemoteTranscode(previousTransportID, previousNodeURL)
 			}
+			h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
 			unlock()
 		},
 		rollback: func() {
@@ -817,9 +907,158 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(session *playback.Session, 
 				return
 			}
 			committed = true
+			// The session never reached the client, so a proxy admitted for it
+			// must not keep consuming that node's job/bandwidth budget until the
+			// reservation ages out.
+			if servedByProxy {
+				releaseProxyReservation()
+			}
 			unlock()
 		},
+	}, nil
+}
+
+// planIdentityProxyV3 selects the proxy node that will serve a direct-play or
+// progressive-remux session. These deliveries need no transcode node — the
+// bytes are either the source file or a single remux pipe — so the planner is
+// asked for a proxy alone, exactly as the Jellyfin-compat transport does.
+//
+// A nil node (no planner, no signing secret, or no eligible proxy) means the
+// API server serves the stream itself, which is both the single-node case and
+// the correct degradation when every proxy is unhealthy or at capacity. The one
+// exception is a remux that must run ffmpeg: that is transcode work, so it
+// honors the same local-fallback gate as the HLS routes rather than quietly
+// spawning an encoder on an API-only node.
+func (h *PlaybackHandler) planIdentityProxyV3(r *http.Request, sessionID string, result playback.PlannerResultV3) (*nodepool.Node, *transportErrorV3) {
+	if h.NodePlanner == nil || h.JWTSecret == "" {
+		return nil, h.refuseLocalIdentityWorkV3(r, result)
 	}
+	// Reserve against the session id the rest of the transport uses, so a
+	// re-plan replaces its own reservation instead of double-counting, and the
+	// rollback path can release it.
+	plan := h.planIdentityProxySessionV3(r.Context(), sessionID, result)
+	if plan.ProxyNode == nil {
+		return nil, h.refuseLocalIdentityWorkV3(r, result)
+	}
+	return plan.ProxyNode, nil
+}
+
+// applyRemoteTransportMarkV3 records whether the committed route's media bytes
+// leave this server or another node.
+//
+// Every committed transition calls it, including the ones that serve locally:
+// a session replanned from a proxy onto the integrated transcoder would
+// otherwise keep a stale mark, and the widened idle grace it grants would hold
+// that session's stream and transcode slots for five minutes after the local
+// stream disconnected without an explicit stop.
+func (h *PlaybackHandler) applyRemoteTransportMarkV3(ctx context.Context, sessionID string, remote bool) {
+	if err := h.sessionMgr.SetRemoteTransport(sessionID, remote); err != nil &&
+		!errors.Is(err, playback.ErrSessionNotFound) {
+		slog.WarnContext(ctx, "failed to record transport locality",
+			"component", "api", "playback_session_id", sessionID, "remote", remote, "error", err)
+	}
+}
+
+// planIdentityProxySessionV3 asks the planner for a proxy, narrowing selection
+// to proxies that can execute the plan's frozen recipe when one is required.
+//
+// The narrowing happens before selection rather than after, mirroring how HLS
+// filters transcode nodes: rejecting a single round-robin pick would abandon
+// the whole pool, so a capable sibling with free capacity would sit unused
+// while playback fell back to the API — or was refused outright when local
+// fallback is disabled.
+//
+// Direct play copies bytes and needs no recipe, so it skips the probe entirely
+// and any healthy proxy serves it.
+func (h *PlaybackHandler) planIdentityProxySessionV3(ctx context.Context, sessionID string, result playback.PlannerResultV3) nodepool.Plan {
+	estBitrate := identityStreamBitrateKbpsV3(result)
+	selector, selectable := h.NodePlanner.(capabilitySessionPlannerV3)
+	enumerator, enumerable := h.NodePlanner.(proxyNodeEnumeratorV3)
+	if !selectable || !enumerable || !planRequiresServerTransformationsV3(result.Plan) {
+		return h.NodePlanner.PlanSession(sessionID, "", false, estBitrate)
+	}
+
+	capable := make(map[string]struct{})
+	for nodeURL, advertised := range h.pooledNodeTransformationsV3(ctx, enumerator.ProxyNodeURLs()) {
+		if validateAdvertisedTransformationsV3(result.Plan, advertised) == nil {
+			capable[nodeURL] = struct{}{}
+		}
+	}
+	if len(capable) == 0 {
+		slog.WarnContext(ctx, "protocol v3 no proxy advertises the planned recipe",
+			"component", "api", "delivery", result.Plan.Delivery)
+	}
+	// The predicate runs under the planner lock: a set lookup only.
+	return selector.PlanSessionWith(sessionID, "", false, estBitrate, func(node *nodepool.Node) bool {
+		if node == nil {
+			return false
+		}
+		_, ok := capable[node.URL]
+		return ok
+	})
+}
+
+// refuseLocalIdentityWorkV3 enforces playback.local_transcode_fallback for the
+// identity deliveries. Direct play moves bytes and always falls back locally;
+// a progressive remux that must convert audio is ffmpeg work, so on an API-only
+// node it is refused for the same reason the HLS routes refuse it, instead of
+// silently spawning an encoder the operator disabled.
+func (h *PlaybackHandler) refuseLocalIdentityWorkV3(r *http.Request, result playback.PlannerResultV3) *transportErrorV3 {
+	if result.Plan == nil || result.Plan.Delivery != playback.DeliveryRemuxProgressiveV3 ||
+		!planRequiresServerTransformationsV3(result.Plan) ||
+		nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
+		return nil
+	}
+	return &transportErrorV3{reason: "capacity_unavailable", message: "No proxy node is available and local fallback is disabled.", retryable: true}
+}
+
+// identityStreamBitrateKbpsV3 estimates the bitrate a proxy will egress for an
+// identity delivery, so bandwidth-capped proxies admit it accurately. The plan's
+// effective recipe is authoritative (a remux that downmixes audio egresses less
+// than the source); the source descriptor is the fallback.
+func identityStreamBitrateKbpsV3(result playback.PlannerResultV3) int {
+	if result.Plan == nil {
+		return 0
+	}
+	if effective := result.Plan.EffectiveRecipe.BitrateKbps; effective != nil && *effective > 0 {
+		return *effective
+	}
+	if source := result.Plan.Source.BitrateKbps; source > 0 {
+		return source
+	}
+	return 0
+}
+
+// identityStreamURLV3 builds the stream URL for a direct-play or
+// progressive-remux session: an absolute proxy URL when one was planned,
+// otherwise the API-local path.
+//
+// The proxy serves from the token alone, so the token has to carry everything
+// the API-local path would have read from the session and the file record: the
+// media path it opens, and the Dolby Vision profile its remux needs to strip a
+// dangling Profile 7 RPU. Omitting either would not fail loudly — the proxy
+// would serve a subtly different stream than the plan promised.
+//
+// The bool reports whether the returned URL is actually a proxy URL, so the
+// caller can release the planner reservation when it is not.
+func (h *PlaybackHandler) identityStreamURLV3(s *playback.Session, file *models.MediaFile, proxyNode *nodepool.Node) (string, bool) {
+	if proxyNode == nil || file == nil {
+		return h.playbackStreamURL(s), false
+	}
+	card := identityRecipeCard(s)
+	card.InputPath = file.FilePath
+	claims := card.ToClaims()
+	claims.DVProfile = file.PrimaryDVProfile()
+	claims.AudioOnly = file.IsAudioOnly()
+	token := h.signStreamClaims(claims)
+	if token == "" {
+		return h.playbackStreamURL(s), false
+	}
+	base := strings.TrimRight(proxyNode.URL, "/")
+	if s.PlayMethod == playback.PlayRemux {
+		return base + "/stream/remux/" + token, true
+	}
+	return base + "/stream/direct/" + token, true
 }
 
 // sessionOwnsResumeTimelineV3 reports whether the session's own position is a
@@ -1030,6 +1269,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			}
 			committed = true
 			previous := h.tm.SwapTranscodeSession(session.ID, ts)
+			h.applyRemoteTransportMarkV3(r.Context(), session.ID, false)
 			unlock()
 			if previous != nil && previous != ts {
 				_ = previous.Close()
@@ -1088,6 +1328,10 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	hw := firstNonEmptyHandlerV3(strings.TrimSpace(nodeResp.HWAccel), strings.TrimSpace(req.HWAccel))
 	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, node.URL, playback.TranscodeOpts{InputPath: req.InputPath, SessionID: session.ID, TranscodeTransportID: transportID, SourceVideoCodec: req.SourceVideoCodec, SourceVideoProfile: req.SourceVideoProfile, SourceVideoBitDepth: req.SourceVideoBitDepth, SoftwareVideoDecode: req.SoftwareVideoDecode, VideoBitstreamFilter: req.VideoBitstreamFilter, SeekSeconds: req.SeekSeconds, StreamOriginSeconds: req.StreamOriginSeconds, CopySeekAnchorResolved: req.CopySeekAnchorResolved, StartSegmentNumber: req.StartSegmentNumber, TargetResolution: req.TargetResolution, TargetCodecVideo: req.TargetCodecVideo, TargetCodecAudio: req.TargetCodecAudio, TargetAudioChannels: req.TargetAudioChannels, TargetAudioBitrateKbps: req.TargetAudioBitrateKbps, TargetBitrateKbps: req.TargetBitrateKbps, SegmentDuration: req.SegmentDuration, HWAccel: hw, AudioTrackIndex: req.AudioTrackIndex, SubtitleTrackIndex: req.SubtitleTrackIndex, SubtitleBurnIn: req.SubtitleBurnIn, SubtitleCodec: req.SubtitleCodec, TotalDuration: req.TotalDuration})
 	url := h.buildProxyManifestURL(card, nodePlan.ProxyNode)
+	// buildProxyManifestURL only returns an absolute proxy URL when a proxy was
+	// planned and the token could be signed; otherwise the client fetches the
+	// manifest from this server and the local liveness path applies.
+	servedByProxy := nodePlan.ProxyNode != nil && strings.HasPrefix(url, "http")
 	committed := false
 	previousNodeURL := session.TranscodeNodeURL
 	previousTransportID := remoteTransportID(session)
@@ -1101,6 +1345,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		if previousNodeURL != "" {
 			h.tm.StopRemoteTranscode(previousTransportID, previousNodeURL)
 		}
+		h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
 		unlock()
 	}, rollback: func() {
 		if committed {
@@ -1915,7 +2160,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			event = playback.RouteEventRuntimeCorrectionSucceededV3
 			clientModel = start.ClientPlaybackContext.Device.Model
 		}
-		h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, PlanAttemptID: req.PlanAttemptID, PlanAttemptKey: playback.PlanAttemptKeyV3(*result.Plan, start.ClientPlaybackContext.Output.OutputContextID, nil), Event: event, FallbackReason: req.Failure.Classification, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: start.ClientPlaybackContext.Output.OutputContextID}, UserID: session.UserID, ProfileID: session.ProfileID, ClientName: session.ClientName, ClientVersion: session.ClientVersion, ClientModel: clientModel})
+		h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, PlanAttemptID: req.PlanAttemptID, PlanAttemptKey: playback.PlanAttemptKeyV3(*result.Plan, start.ClientPlaybackContext.Output.OutputContextID, nil), Event: event, FallbackReason: req.Failure.Classification, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: start.ClientPlaybackContext.Output.OutputContextID}, UserID: session.UserID, ProfileID: session.ProfileID, ClientName: session.ClientName, ClientVersion: session.ClientVersion, ClientBuild: session.ClientBuild, ClientChannel: session.ClientChannel, ClientModel: clientModel})
 	}
 	transport.rollback = func() {
 		originalRollback()
@@ -2361,15 +2606,32 @@ func shouldTryAlternateFileV3(qualityPreference string) bool {
 }
 
 const (
-	terminalNoAlternateVersionV3      = "no_alternate_version"
-	terminalHDRTranscodeUnsupportedV3 = "hdr_transcode_unsupported"
+	terminalNoAlternateVersionV3            = "no_alternate_version"
+	terminalHDRTranscodeUnsupportedV3       = "hdr_transcode_unsupported"
+	terminalSubtitleConversionUnsupportedV3 = "subtitle_conversion_unsupported"
 )
 
+// terminalAllowsAlternateFileV3 reports whether a refusal is the kind another
+// version of the same item could satisfy.
+//
+// subtitle_conversion_unsupported belongs here because it is not only a
+// subtitle-format refusal: when a burn-in requirement is the sole trigger of an
+// adaptation the source cannot take, the planner reports the blocker in terms
+// of the subtitle rather than the HDR pipeline or the 4K policy. Those cases
+// used to surface as hdr_transcode_unsupported / no_alternate_version and were
+// the exact reason this gate exists — a bitmap subtitle needing burn-in that an
+// HDR source cannot support while an SDR alternate can. Leaving the new reason
+// out silently retired that fallback and refused playback outright.
 func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
 	if terminal == nil {
 		return false
 	}
-	return terminal.Reason == terminalNoAlternateVersionV3 || terminal.Reason == terminalHDRTranscodeUnsupportedV3
+	switch terminal.Reason {
+	case terminalNoAlternateVersionV3, terminalHDRTranscodeUnsupportedV3, terminalSubtitleConversionUnsupportedV3:
+		return true
+	default:
+		return false
+	}
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
@@ -2509,8 +2771,8 @@ func (h *PlaybackHandler) HandlePlaybackRouteEventV3(w http.ResponseWriter, r *h
 		return
 	}
 	event.Diagnostics = sanitizeDiagnosticsV3(event.Diagnostics)
-	client := playbackClientInfoFromRequest(r)
-	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: event, UserID: userID, ProfileID: profileID, ClientName: client.Name, ClientVersion: client.Version, ClientModel: event.Diagnostics["device_model"]})
+	client := h.playbackClientInfoWithSessionFallbackV3(firstNonEmptyValue(event.SessionID, identity.SessionID), playbackClientInfoFromRequest(r))
+	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: event, UserID: userID, ProfileID: profileID, ClientName: client.Name, ClientVersion: client.Version, ClientBuild: client.Build, ClientChannel: client.Channel, ClientModel: event.Diagnostics["device_model"]})
 	w.WriteHeader(http.StatusAccepted)
 }
 

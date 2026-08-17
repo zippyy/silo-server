@@ -331,12 +331,17 @@ type DeliveryCapabilityV3 struct {
 // advertisement lives exclusively in the request's top-level client_features
 // list; there is deliberately no second features location here.
 type ClientPlaybackContextV3 struct {
-	ProtocolVersion int                             `json:"protocol_version"`
-	FormFactor      string                          `json:"form_factor"`
-	AppVersion      string                          `json:"app_version"`
-	Device          DeviceContextV3                 `json:"device"`
-	Output          OutputContextV3                 `json:"output"`
-	Deliveries      map[string]DeliveryCapabilityV3 `json:"deliveries"`
+	ProtocolVersion int    `json:"protocol_version"`
+	FormFactor      string `json:"form_factor"`
+	AppVersion      string `json:"app_version"`
+	// AppBuild and AppChannel are the request-body fallback for the
+	// X-Silo-Client-Build / X-Silo-Client-Channel headers. Both are opaque
+	// strings the server stores verbatim.
+	AppBuild   string                          `json:"app_build,omitempty"`
+	AppChannel string                          `json:"app_channel,omitempty"`
+	Device     DeviceContextV3                 `json:"device"`
+	Output     OutputContextV3                 `json:"output"`
+	Deliveries map[string]DeliveryCapabilityV3 `json:"deliveries"`
 }
 
 type StartRequestV3 struct {
@@ -890,6 +895,13 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 	if len(c.CodecsVideo) > 64 || len(c.CodecsVideoHardware) > 64 || len(c.CodecsAudio) > 64 || len(c.Containers) > 64 || len(c.VideoDecode) > 64 || len(ctx.Deliveries) > 16 || len(ctx.Device.Platform) > 32 || len(ctx.FormFactor) > 32 || len(ctx.AppVersion) > 64 {
 		return errors.New("capability list exceeds supported size")
 	}
+	// Build and channel are opaque diagnostic labels, so an over-long value is
+	// worth clamping and never worth refusing playback over. The header route
+	// (X-Silo-Client-Build / -Channel) clamps with the same helper; rejecting
+	// here would mean the same string plays from a header and 400s from the
+	// body.
+	ctx.AppBuild = normalizeClientMetadataValue(ctx.AppBuild, 64)
+	ctx.AppChannel = normalizeClientMetadataValue(ctx.AppChannel, 32)
 	deviceValues := []string{
 		ctx.Device.OSVersion, ctx.Device.Manufacturer, ctx.Device.Model,
 		ctx.Output.CurrentSink, ctx.Output.SinkType, ctx.Output.OutputContextID,

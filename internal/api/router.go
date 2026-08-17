@@ -1438,6 +1438,14 @@ func NewRouter(deps Dependencies) chi.Router {
 		}
 
 		libraryCollectionRepo := catalog.NewLibraryCollectionRepository(deps.DB)
+		var collectionSortCleaner *userstore.CollectionSortPreferenceCleaner
+		if userRepo != nil && deps.UserStoreProvider != nil {
+			collectionSortCleaner = userstore.NewCollectionSortPreferenceCleaner(userRepo, deps.UserStoreProvider)
+		}
+		if collectionHandler != nil {
+			collectionHandler.LibraryCollections = libraryCollectionRepo
+		}
+		sectionHandler.SortPreferenceCleaner = collectionSortCleaner
 		if libraryCollectionService == nil {
 			libraryCollectionService = catalog.NewLibraryCollectionService(
 				libraryCollectionRepo,
@@ -1537,6 +1545,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		libraryCollectionHandler.SectionRepo = sectionRepo
 		libraryCollectionHandler.UserCollectionPool = deps.DB
 		libraryCollectionHandler.EventsHub = deps.EventsHub
+		libraryCollectionHandler.SortPreferenceCleaner = collectionSortCleaner
 		if deps.FolderRepo != nil {
 			libraryCollectionHandler.FolderRepo = deps.FolderRepo
 		} else {
@@ -2291,6 +2300,8 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Use(apimw.RequireProfile)
 						r.Get("/", collectionHandler.HandleListCollections)
 						r.Get("/capabilities", collectionHandler.HandleCapabilities)
+						r.Put("/sort-preference", collectionHandler.HandleSetCollectionSortPreference)
+						r.Delete("/sort-preference", collectionHandler.HandleClearCollectionSortPreference)
 						if libraryCollectionHandler != nil {
 							// Aggregated server (admin-curated) collections across
 							// every accessible library. Separate from "/" (personal,
@@ -2575,6 +2586,11 @@ func NewRouter(deps Dependencies) chi.Router {
 						}
 					}
 					r.Route("/subtitles", func(r chi.Router) {
+						// Capability probe for external subtitle search. Two
+						// segments on purpose: a bare /providers would shadow
+						// the /{media_file_id} route below, while
+						// /providers/status never competes with it in chi.
+						r.Get("/providers/status", subtitleSearchHandler.HandleProviderStatus)
 						r.Post("/search", subtitleSearchHandler.HandleSearch)
 						r.Post("/download", subtitleSearchHandler.HandleDownload)
 						r.Post("/upload", subtitleSearchHandler.HandleUpload)
@@ -2594,6 +2610,17 @@ func NewRouter(deps Dependencies) chi.Router {
 						}
 						r.Get("/{media_file_id}", subtitleSearchHandler.HandleList)
 						r.Delete("/{id}", subtitleSearchHandler.HandleDelete)
+					})
+				} else {
+					// The whole group above is conditional (it needs the DB,
+					// S3 and the subtitle repo), so on a storage-less
+					// deployment the capability probe would 404 — leaving a
+					// client to interpret the same ambiguous status the probe
+					// exists to replace. Mount the probe alone, answering
+					// enabled:false, so feature detection always gets a real
+					// answer.
+					r.Route("/subtitles", func(r chi.Router) {
+						r.Get("/providers/status", handlers.WriteSubtitleProvidersDisabledStatus)
 					})
 				}
 
